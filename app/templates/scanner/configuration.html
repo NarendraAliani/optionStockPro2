@@ -1,0 +1,208 @@
+{% extends "base.html" %}
+
+{% block title %}Scanner Configuration - Options Signal Scanner Pro{% endblock %}
+
+{% block content %}
+<div class="config-container">
+    <div class="config-header">
+        <h1 class="config-title">
+            <i class="fas fa-sliders-h"></i> Scanner Configuration
+        </h1>
+    </div>
+
+    <div class="config-card">
+        <div class="config-card-header">
+            <i class="fas fa-list"></i> Default Scanner Settings
+        </div>
+        <div class="config-card-body">
+            <form id="scannerConfigForm">
+                <div class="form-row">
+                    <div class="form-group">
+                        <label class="form-label" for="stockMode">Stock Selection</label>
+                        <select class="form-control" id="stockMode">
+                            <option value="all">All NFO OPTSTK Stocks</option>
+                            <option value="nifty50">NIFTY Index</option>
+                            <option value="banknifty">BANK NIFTY Index</option>
+                            <option value="single">Single OPTSTK Stock</option>
+                            <option value="selected">Selected OPTSTK Stocks</option>
+                        </select>
+                    </div>
+                    <div class="form-group" id="singleStockWrap" style="display:none;">
+                        <label class="form-label" for="singleStock">Select Stock</label>
+                        <select class="form-control" id="singleStock"></select>
+                    </div>
+                    <div class="form-group" id="selectedStocksWrap" style="display:none;">
+                        <label class="form-label" for="selectedStocks">Select Stocks</label>
+                        <select class="form-control" id="selectedStocks" multiple size="6"></select>
+                        <small class="form-help">Hold Ctrl to select multiple stocks</small>
+                    </div>
+                </div>
+
+                <div class="form-row">
+                    <div class="form-group">
+                        <label class="form-label" for="strikeRange">Strike Range</label>
+                        <input type="number" class="form-control" id="strikeRange" value="5" min="1" max="20">
+                        <small class="form-help">Strikes nearest to current price</small>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="priceMultiplier">Price Multiplier</label>
+                        <input type="number" class="form-control" id="priceMultiplier" value="2" min="1" max="10" step="0.1">
+                        <small class="form-help">Signal threshold multiplier</small>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="timeframe">Timeframe</label>
+                        <select class="form-control" id="timeframe">
+                            <option value="1">1 Minute</option>
+                            <option value="3">3 Minutes</option>
+                            <option value="5">5 Minutes</option>
+                            <option value="15">15 Minutes</option>
+                            <option value="30">30 Minutes</option>
+                            <option value="60">1 Hour</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div class="form-row">
+                    <div class="form-group">
+                        <label class="form-label" for="refreshInterval">Refresh Interval (minutes)</label>
+                        <input type="number" class="form-control" id="refreshInterval" value="5" min="1" max="60">
+                    </div>
+                    <div class="form-group-submit">
+                        <button type="submit" class="btn-save-config" id="btnSaveConfig">
+                            <i class="fas fa-check me-2"></i>Save Configuration
+                        </button>
+                    </div>
+                </div>
+            </form>
+            <div id="configResult" class="small text-muted mt-2"></div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+
+{% block extra_js %}
+<script>
+    let availableStocks = [];
+
+    $(document).ready(function() {
+        loadStockOptions().then(loadConfig);
+        $('#stockMode').on('change', function() {
+            toggleStockMode();
+        });
+
+        $('#scannerConfigForm').on('submit', function(e) {
+            e.preventDefault();
+            saveConfig();
+        });
+    });
+
+    function loadStockOptions() {
+        return $.ajax({
+            url: '/scanner/api/stocks',
+            method: 'GET'
+        }).done(function(response) {
+            if (!response.success) return;
+            availableStocks = response.stocks || [];
+            const select = $('#singleStock');
+            const multi = $('#selectedStocks');
+            select.empty();
+            multi.empty();
+            availableStocks.forEach(function(symbol) {
+                select.append('<option value=\"' + symbol + '\">' + symbol + '</option>');
+                multi.append('<option value=\"' + symbol + '\">' + symbol + '</option>');
+            });
+        });
+    }
+
+    function loadConfig() {
+        $.ajax({
+            url: '/scanner/api/config',
+            method: 'GET',
+            success: function(response) {
+                if (!response.success) return;
+                const cfg = response.config || {};
+                const selection = cfg.stockSelection || 'all';
+                if (Array.isArray(selection) && selection.length) {
+                    if (selection.length === 1) {
+                        $('#stockMode').val('single');
+                        $('#singleStock').val(selection[0]);
+                    } else {
+                        $('#stockMode').val('selected');
+                        $('#selectedStocks').val(selection);
+                    }
+                } else if (typeof selection === 'string' && ['all', 'nifty50', 'banknifty'].includes(selection)) {
+                    $('#stockMode').val(selection);
+                } else if (typeof selection === 'string' && selection) {
+                    $('#stockMode').val('single');
+                    if ($('#singleStock option[value=\"' + selection + '\"]').length === 0) {
+                        $('#singleStock').append('<option value=\"' + selection + '\">' + selection + '</option>');
+                    }
+                    if ($('#selectedStocks option[value=\"' + selection + '\"]').length === 0) {
+                        $('#selectedStocks').append('<option value=\"' + selection + '\">' + selection + '</option>');
+                    }
+                    $('#singleStock').val(selection);
+                } else {
+                    $('#stockMode').val('all');
+                }
+                toggleStockMode();
+                $('#strikeRange').val(cfg.strikeRange || 5);
+                $('#priceMultiplier').val(cfg.priceMultiplier || 2);
+                $('#timeframe').val(cfg.timeframe || 5);
+                $('#refreshInterval').val(cfg.refreshInterval || 5);
+            }
+        });
+    }
+
+    function toggleStockMode() {
+        const mode = $('#stockMode').val();
+        $('#singleStockWrap').toggle(mode === 'single');
+        $('#selectedStocksWrap').toggle(mode === 'selected');
+    }
+
+    function saveConfig() {
+        const stockMode = $('#stockMode').val();
+        let stockSelection = stockMode;
+        if (stockMode === 'single') {
+            stockSelection = [$('#singleStock').val()];
+        } else if (stockMode === 'selected') {
+            stockSelection = $('#selectedStocks').val() || [];
+            if (!stockSelection.length) {
+                $('#configResult').removeClass('text-muted text-success').addClass('text-danger').text('Please select at least one stock.');
+                return;
+            }
+        }
+
+        const payload = {
+            stockSelection: stockSelection,
+            strikeRange: $('#strikeRange').val(),
+            priceMultiplier: $('#priceMultiplier').val(),
+            timeframe: $('#timeframe').val(),
+            refreshInterval: $('#refreshInterval').val()
+        };
+
+        $('#configResult').removeClass('text-success text-danger').addClass('text-muted').text('Saving...');
+
+        $.ajax({
+            url: '/scanner/api/config',
+            method: 'POST',
+            contentType: 'application/json',
+            data: JSON.stringify(payload),
+            headers: {
+                'X-CSRFToken': '{{ csrf_token() }}'
+            },
+            success: function(response) {
+                if (response.success) {
+                    $('#configResult').removeClass('text-muted text-danger').addClass('text-success').text(response.message || 'Saved.');
+                } else {
+                    $('#configResult').removeClass('text-muted text-success').addClass('text-danger').text(response.error || 'Failed to save.');
+                }
+            },
+            error: function(xhr) {
+                const error = xhr.responseJSON ? xhr.responseJSON.error : 'Failed to save configuration.';
+                $('#configResult').removeClass('text-muted text-success').addClass('text-danger').text(error);
+            }
+        });
+    }
+</script>
+{% endblock %}

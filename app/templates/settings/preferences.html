@@ -1,0 +1,252 @@
+{% extends "base.html" %}
+
+{% block title %}Preferences - Options Signal Scanner Pro{% endblock %}
+
+{% block content %}
+<div class="row">
+    <div class="col-md-8 offset-md-2">
+        <h2 class="mb-4">
+            <i class="bi bi-sliders"></i> User Preferences
+        </h2>
+        
+        <div class="card">
+            <div class="card-body">
+                <form method="POST" action="{{ url_for('settings.preferences') }}">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
+                    <div class="mb-3">
+                        <label for="theme" class="form-label">Theme Preference</label>
+                        <select class="form-select" id="theme" name="theme">
+                            <option value="light" {% if user.theme_preference == 'light' %}selected{% endif %}>Light</option>
+                            <option value="dark" {% if user.theme_preference == 'dark' %}selected{% endif %}>Dark</option>
+                        </select>
+                    </div>
+                    
+                    <div class="d-grid gap-2">
+                        <button type="submit" class="btn btn-primary">Save Preferences</button>
+                        <a href="{{ url_for('dashboard.index') }}" class="btn btn-outline-secondary">Cancel</a>
+                    </div>
+                </form>
+            </div>
+        </div>
+
+        <div class="card mt-4">
+            <div class="card-body">
+                <h5 class="mb-3"><i class="bi bi-volume-up me-2"></i>Notification Sound</h5>
+                <div class="mb-3">
+                    <label for="soundSource" class="form-label">Sound Source</label>
+                    <select class="form-select" id="soundSource">
+                        <option value="beep">Built-in Beep (Recommended)</option>
+                        <option value="custom">Custom Audio File</option>
+                    </select>
+                </div>
+                <div class="mb-3" id="customSoundWrap">
+                    <label for="customSoundFile" class="form-label">Choose Sound From System</label>
+                    <input type="file" class="form-control" id="customSoundFile" accept="audio/*">
+                    <small class="text-muted">Supports common audio formats. Keep file short for quick alert.</small>
+                    <div class="small mt-2" id="customSoundInfo"></div>
+                </div>
+                <div class="d-flex gap-2">
+                    <button type="button" class="btn btn-outline-primary" id="btnSaveSoundPref">Save Sound Preference</button>
+                    <button type="button" class="btn btn-outline-success" id="btnTestSoundPref">Test Sound</button>
+                    <button type="button" class="btn btn-outline-secondary" id="btnClearCustomSound">Clear Custom Sound</button>
+                </div>
+                <div class="small mt-2 text-muted" id="soundPrefStatus"></div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+    (function() {
+        const sourceEl = document.getElementById('soundSource');
+        const fileEl = document.getElementById('customSoundFile');
+        const wrapEl = document.getElementById('customSoundWrap');
+        const infoEl = document.getElementById('customSoundInfo');
+        const statusEl = document.getElementById('soundPrefStatus');
+        const saveBtn = document.getElementById('btnSaveSoundPref');
+        const testBtn = document.getElementById('btnTestSoundPref');
+        const clearBtn = document.getElementById('btnClearCustomSound');
+
+        const enabledWrap = document.createElement('div');
+        enabledWrap.className = 'form-check form-switch mb-3';
+        enabledWrap.innerHTML = '<input class="form-check-input" type="checkbox" id="soundEnabled" checked><label class="form-check-label" for="soundEnabled">Enable Notification Sound</label>';
+        sourceEl.closest('.mb-3').parentNode.insertBefore(enabledWrap, sourceEl.closest('.mb-3'));
+        const enabledEl = document.getElementById('soundEnabled');
+
+        let stagedDataUrl = '';
+        let stagedFileName = '';
+
+        function setStatus(msg, isError) {
+            statusEl.textContent = msg || '';
+            statusEl.classList.remove('text-danger', 'text-success', 'text-muted');
+            statusEl.classList.add(isError ? 'text-danger' : 'text-success');
+        }
+
+        function refreshUI() {
+            const source = (sourceEl.value || 'beep').toLowerCase();
+            wrapEl.style.display = source === 'custom' ? '' : 'none';
+            if (stagedFileName) {
+                infoEl.textContent = 'Selected: ' + stagedFileName;
+            } else {
+                infoEl.textContent = 'No custom sound selected.';
+            }
+        }
+
+        function loadPrefs() {
+            fetch('{{ url_for("settings.get_sound_preferences") }}', {
+                method: 'GET',
+                credentials: 'same-origin'
+            })
+            .then(function(resp) { return resp.json(); })
+            .then(function(data) {
+                if (!data || !data.success) return;
+                const pref = data.preferences || {};
+                enabledEl.checked = pref.enabled !== false;
+                sourceEl.value = String(pref.source || 'beep').toLowerCase();
+                stagedDataUrl = pref.data_url || '';
+                stagedFileName = pref.filename || '';
+                refreshUI();
+            })
+            .catch(function() {});
+        }
+        loadPrefs();
+
+        sourceEl.addEventListener('change', refreshUI);
+
+        fileEl.addEventListener('change', function() {
+            const file = fileEl.files && fileEl.files[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = function() {
+                stagedDataUrl = String(reader.result || '');
+                stagedFileName = file.name || 'custom-sound';
+                infoEl.textContent = 'Selected: ' + stagedFileName;
+                setStatus('Custom sound loaded. Click "Save Sound Preference".', false);
+            };
+            reader.onerror = function() {
+                setStatus('Failed to read selected sound file.', true);
+            };
+            reader.readAsDataURL(file);
+        });
+
+        saveBtn.addEventListener('click', function() {
+            const source = (sourceEl.value || 'beep').toLowerCase();
+            const payload = {
+                enabled: !!enabledEl.checked,
+                source: source,
+                data_url: '',
+                filename: ''
+            };
+            if (source === 'custom') {
+                if (!stagedDataUrl) {
+                    setStatus('Please select a custom sound file first.', true);
+                    return;
+                }
+                payload.data_url = stagedDataUrl;
+                payload.filename = stagedFileName || 'custom-sound';
+            }
+            fetch('{{ url_for("settings.save_sound_preferences") }}', {
+                method: 'POST',
+                credentials: 'same-origin',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-CSRFToken': '{{ csrf_token() }}'
+                },
+                body: JSON.stringify(payload)
+            })
+            .then(function(resp) { return resp.json(); })
+            .then(function(data) {
+                if (!data || !data.success) {
+                    setStatus((data && data.error) ? data.error : 'Failed to save sound preference.', true);
+                    return;
+                }
+                const pref = data.preferences || {};
+                enabledEl.checked = pref.enabled !== false;
+                sourceEl.value = String(pref.source || 'beep').toLowerCase();
+                stagedDataUrl = pref.data_url || stagedDataUrl;
+                stagedFileName = pref.filename || stagedFileName;
+                refreshUI();
+                setStatus('Sound preference saved for this account.', false);
+            })
+            .catch(function() {
+                setStatus('Failed to save sound preference.', true);
+            });
+        });
+
+        testBtn.addEventListener('click', function() {
+            const source = (sourceEl.value || 'beep').toLowerCase();
+            if (source === 'custom') {
+                const dataUrl = stagedDataUrl || '';
+                if (!dataUrl) {
+                    setStatus('No custom sound available to test.', true);
+                    return;
+                }
+                try {
+                    const audio = new Audio(dataUrl);
+                    audio.play().catch(function() {
+                        setStatus('Browser blocked autoplay. Click page once and retry.', true);
+                    });
+                } catch (e) {
+                    setStatus('Could not play custom sound.', true);
+                }
+                return;
+            }
+            try {
+                const Ctx = window.AudioContext || window.webkitAudioContext;
+                if (!Ctx) {
+                    setStatus('Audio API is unavailable in this browser.', true);
+                    return;
+                }
+                const ctx = new Ctx();
+                const start = ctx.currentTime + 0.01;
+                [880, 1175].forEach(function(freq, idx) {
+                    const t0 = start + idx * 0.19;
+                    const osc = ctx.createOscillator();
+                    const gain = ctx.createGain();
+                    osc.type = 'sine';
+                    osc.frequency.value = freq;
+                    gain.gain.setValueAtTime(0.0001, t0);
+                    gain.gain.exponentialRampToValueAtTime(0.2, t0 + 0.02);
+                    gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.12);
+                    osc.connect(gain);
+                    gain.connect(ctx.destination);
+                    osc.start(t0);
+                    osc.stop(t0 + 0.12);
+                });
+            } catch (e) {
+                setStatus('Could not play built-in beep.', true);
+            }
+        });
+
+        clearBtn.addEventListener('click', function() {
+            stagedDataUrl = '';
+            stagedFileName = '';
+            fileEl.value = '';
+            fetch('{{ url_for("settings.save_sound_preferences") }}', {
+                method: 'POST',
+                credentials: 'same-origin',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-CSRFToken': '{{ csrf_token() }}'
+                },
+                body: JSON.stringify({ clear_custom: true, enabled: !!enabledEl.checked })
+            })
+            .then(function(resp) { return resp.json(); })
+            .then(function(data) {
+                if (!data || !data.success) {
+                    setStatus((data && data.error) ? data.error : 'Failed to clear custom sound.', true);
+                    return;
+                }
+                sourceEl.value = 'beep';
+                refreshUI();
+                setStatus('Custom sound cleared. Using built-in beep.', false);
+            })
+            .catch(function() {
+                setStatus('Failed to clear custom sound.', true);
+            });
+        });
+    })();
+</script>
+{% endblock %}
