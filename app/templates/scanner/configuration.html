@@ -67,6 +67,60 @@
                         <label class="form-label" for="refreshInterval">Refresh Interval (minutes)</label>
                         <input type="number" class="form-control" id="refreshInterval" value="5" min="1" max="60">
                     </div>
+                    <div class="form-group">
+                        <label class="form-label" for="scanProfile">Performance Profile</label>
+                        <select class="form-control" id="scanProfile">
+                            <option value="conservative">Conservative</option>
+                            <option value="balanced" selected>Balanced</option>
+                            <option value="aggressive">Aggressive</option>
+                        </select>
+                        <small class="form-help">Profile influences auto-tune worker selection.</small>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="workersCap">Workers Cap</label>
+                        <input type="number" class="form-control" id="workersCap" value="8" min="1" max="16">
+                        <small class="form-help">Upper bound for worker count.</small>
+                    </div>
+                </div>
+
+                <div class="form-row">
+                    <div class="form-group">
+                        <label class="form-label d-block">Runtime Defaults</label>
+                        <div class="form-check mb-2">
+                            <input class="form-check-input" type="checkbox" id="autoTune">
+                            <label class="form-check-label" for="autoTune">Auto Tune Workers</label>
+                        </div>
+                        <div class="form-check">
+                            <input class="form-check-input" type="checkbox" id="livePrefilterEnabled">
+                            <label class="form-check-label" for="livePrefilterEnabled">Live Pre-filter Enabled</label>
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="livePrefilterTopMovers">Pre-filter Top Movers</label>
+                        <input type="number" class="form-control" id="livePrefilterTopMovers" value="30" min="0" max="500">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="livePrefilterTopVolume">Pre-filter Top Volume</label>
+                        <input type="number" class="form-control" id="livePrefilterTopVolume" value="30" min="0" max="500">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="livePrefilterMaxStocks">Pre-filter Max Stocks</label>
+                        <input type="number" class="form-control" id="livePrefilterMaxStocks" value="50" min="1" max="500">
+                    </div>
+                </div>
+
+                <div class="form-row">
+                    <div class="form-group">
+                        <label class="form-label d-block">Guardrails</label>
+                        <div class="form-check mb-2">
+                            <input class="form-check-input" type="checkbox" id="guardrailEnabled" checked>
+                            <label class="form-check-label" for="guardrailEnabled">Warn Before Heavy Run</label>
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="guardrailLoadThreshold">Guardrail Load Threshold</label>
+                        <input type="number" class="form-control" id="guardrailLoadThreshold" value="1200" min="100" max="25000">
+                    </div>
                     <div class="form-group-submit">
                         <button type="submit" class="btn-save-config" id="btnSaveConfig">
                             <i class="fas fa-check me-2"></i>Save Configuration
@@ -74,6 +128,15 @@
                     </div>
                 </div>
             </form>
+            <div class="d-flex gap-2 mt-2">
+                <button type="button" class="btn btn-outline-secondary btn-sm" id="btnExportConfig">
+                    <i class="fas fa-download me-1"></i>Export Config
+                </button>
+                <button type="button" class="btn btn-outline-secondary btn-sm" id="btnImportConfig">
+                    <i class="fas fa-upload me-1"></i>Import Config
+                </button>
+                <input type="file" id="importConfigFile" accept="application/json" style="display:none;">
+            </div>
             <div id="configResult" class="small text-muted mt-2"></div>
         </div>
     </div>
@@ -95,6 +158,9 @@
             e.preventDefault();
             saveConfig();
         });
+        $('#btnExportConfig').on('click', exportConfig);
+        $('#btnImportConfig').on('click', function() { $('#importConfigFile').trigger('click'); });
+        $('#importConfigFile').on('change', importConfigFromFile);
     });
 
     function loadStockOptions() {
@@ -150,6 +216,15 @@
                 $('#priceMultiplier').val(cfg.priceMultiplier || 2);
                 $('#timeframe').val(cfg.timeframe || 5);
                 $('#refreshInterval').val(cfg.refreshInterval || 5);
+                $('#scanProfile').val(cfg.scanProfile || 'balanced');
+                $('#workersCap').val(cfg.workers || 8);
+                $('#autoTune').prop('checked', cfg.autoTune !== false);
+                $('#livePrefilterEnabled').prop('checked', cfg.livePrefilterEnabled !== false);
+                $('#livePrefilterTopMovers').val(cfg.livePrefilterTopMovers || 30);
+                $('#livePrefilterTopVolume').val(cfg.livePrefilterTopVolume || 30);
+                $('#livePrefilterMaxStocks').val(cfg.livePrefilterMaxStocks || 50);
+                $('#guardrailEnabled').prop('checked', cfg.guardrailEnabled !== false);
+                $('#guardrailLoadThreshold').val(cfg.guardrailLoadThreshold || 1200);
             }
         });
     }
@@ -178,7 +253,18 @@
             strikeRange: $('#strikeRange').val(),
             priceMultiplier: $('#priceMultiplier').val(),
             timeframe: $('#timeframe').val(),
-            refreshInterval: $('#refreshInterval').val()
+            refreshInterval: $('#refreshInterval').val(),
+            scanProfile: $('#scanProfile').val(),
+            workers: $('#workersCap').val(),
+            liveWorkersCap: $('#workersCap').val(),
+            backtestWorkersCap: $('#workersCap').val(),
+            autoTune: $('#autoTune').is(':checked'),
+            livePrefilterEnabled: $('#livePrefilterEnabled').is(':checked'),
+            livePrefilterTopMovers: $('#livePrefilterTopMovers').val(),
+            livePrefilterTopVolume: $('#livePrefilterTopVolume').val(),
+            livePrefilterMaxStocks: $('#livePrefilterMaxStocks').val(),
+            guardrailEnabled: $('#guardrailEnabled').is(':checked'),
+            guardrailLoadThreshold: $('#guardrailLoadThreshold').val()
         };
 
         $('#configResult').removeClass('text-success text-danger').addClass('text-muted').text('Saving...');
@@ -203,6 +289,73 @@
                 $('#configResult').removeClass('text-muted text-success').addClass('text-danger').text(error);
             }
         });
+    }
+
+    function exportConfig() {
+        $.ajax({
+            url: '/scanner/api/config/export',
+            method: 'GET',
+            success: function(response) {
+                if (!response.success) {
+                    $('#configResult').removeClass('text-muted text-success').addClass('text-danger').text(response.error || 'Export failed.');
+                    return;
+                }
+                const text = JSON.stringify(response.payload || {}, null, 2);
+                const blob = new Blob([text], { type: 'application/json' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+                a.href = url;
+                a.download = 'scanner-config-' + stamp + '.json';
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+                $('#configResult').removeClass('text-muted text-danger').addClass('text-success').text('Configuration exported.');
+            },
+            error: function() {
+                $('#configResult').removeClass('text-muted text-success').addClass('text-danger').text('Export failed.');
+            }
+        });
+    }
+
+    function importConfigFromFile() {
+        const fileEl = $('#importConfigFile')[0];
+        const file = fileEl && fileEl.files && fileEl.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = function() {
+            let payload = null;
+            try {
+                payload = JSON.parse(String(reader.result || '{}'));
+            } catch (e) {
+                $('#configResult').removeClass('text-muted text-success').addClass('text-danger').text('Invalid JSON file.');
+                return;
+            }
+            $.ajax({
+                url: '/scanner/api/config/import',
+                method: 'POST',
+                contentType: 'application/json',
+                headers: { 'X-CSRFToken': '{{ csrf_token() }}' },
+                data: JSON.stringify({ payload: payload }),
+                success: function(response) {
+                    if (!response.success) {
+                        $('#configResult').removeClass('text-muted text-success').addClass('text-danger').text(response.error || 'Import failed.');
+                        return;
+                    }
+                    $('#configResult').removeClass('text-muted text-danger').addClass('text-success').text(response.message || 'Imported.');
+                    loadConfig();
+                },
+                error: function(xhr) {
+                    const msg = xhr.responseJSON && xhr.responseJSON.error ? xhr.responseJSON.error : 'Import failed.';
+                    $('#configResult').removeClass('text-muted text-success').addClass('text-danger').text(msg);
+                }
+            });
+        };
+        reader.onerror = function() {
+            $('#configResult').removeClass('text-muted text-success').addClass('text-danger').text('Unable to read file.');
+        };
+        reader.readAsText(file);
     }
 </script>
 {% endblock %}

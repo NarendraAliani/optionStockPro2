@@ -4,10 +4,12 @@ Scanner Manager for live and backtest execution
 from datetime import datetime, timedelta
 from threading import Lock
 from threading import Thread
+import os
 from app import socketio, db
 from app.models.api_credential import APICredential
 from app.models.scanner_config import ScannerConfig
 from app.models.signal import Signal
+from app.models.user import User
 from app.services.angel_api import AngelOneAPI
 from app.services.scanner_engine import ScannerEngine
 from app.utils.encryption import EncryptionHelper
@@ -20,6 +22,8 @@ _live_scanners = {}
 _scanner_status = {}
 _backtest_status = {}
 _backtest_jobs = {}
+DEFAULT_SCAN_WORKERS = 8
+MAX_SCAN_WORKERS = 16
 
 
 def _safe_int(value, default=0):
@@ -27,6 +31,164 @@ def _safe_int(value, default=0):
         return int(value)
     except Exception:
         return default
+
+
+def _safe_bool(value, default=False):
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    return str(value).strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def _optional_bool(value):
+    if value in (None, ''):
+        return None
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in ('1', 'true', 'yes', 'on'):
+        return True
+    if text in ('0', 'false', 'no', 'off'):
+        return False
+    return None
+
+
+def _parse_iso_utc(value):
+    if not value:
+        return None
+    try:
+        text = str(value).strip()
+        if text.endswith('Z'):
+            text = text[:-1] + '+00:00'
+        return datetime.fromisoformat(text)
+    except Exception:
+        return None
+
+
+def _timeframe_minutes(value, default=5):
+    text = str(value or '').strip().lower()
+    if text.endswith('min'):
+        text = text[:-3]
+    minutes = _safe_int(text, default)
+    return minutes if minutes > 0 else default
+
+
+def _clamp_int(value, minimum, maximum, default):
+    num = _safe_int(value, default)
+    return max(minimum, min(maximum, num))
+
+
+def _estimate_symbol_count(stock_selection, mode='live'):
+    if isinstance(stock_selection, list):
+        return max(1, len([s for s in stock_selection if str(s).strip()]))
+    token = str(stock_selection or 'all').strip().lower()
+    if token == 'all':
+        # NFO OPTSTK universe is typically large; live prefilter narrows workload.
+        return 120 if mode == 'live' else 180
+    if token == 'nifty50':
+        return 50
+    if token == 'banknifty':
+        return 1
+    return 1
+
+
+def _scan_profile(config_data, user):
+    cfg_data = config_data if isinstance(config_data, dict) else {}
+    token = str(cfg_data.get('scanProfile') or getattr(user, 'scan_profile', 'balanced') or 'balanced').strip().lower()
+    return token if token in ('conservative', 'balanced', 'aggressive') else 'balanced'
+
+
+def _recent_rate_limit_hint(user_id, mode='live'):
+    status_map = _scanner_status if str(mode).lower() == 'live' else _backtest_status
+    status = status_map.get(user_id) or {}
+    last_error = str(status.get('last_error') or '').lower()
+    return any(token in last_error for token in ('429', 'rate limit', 'too many requests', 'throttle'))
+
+
+def _auto_tune_workers(user_id, config_data, fallback_cap, mode='live'):
+    cfg_data = config_data if isinstance(config_data, dict) else {}
+    mode_name = 'backtest' if str(mode).lower() == 'backtest' else 'live'
+    user = User.query.get(user_id)
+    cpu = max(1, _safe_int(os.cpu_count(), 4))
+    cap = max(1, min(MAX_SCAN_WORKERS, _safe_int(fallback_cap, DEFAULT_SCAN_WORKERS)))
+    profile = _scan_profile(cfg_data, user)
+    timeframe = _timeframe_minutes(cfg_data.get('timeframe'), 5)
+    strike_range = max(1, min(20, _safe_int(cfg_data.get('strikeRange'), 2 if mode_name == 'live' else 5)))
+    symbol_count = _estimate_symbol_count(cfg_data.get('stockSelection', 'all'), mode_name)
+
+    date_span_days = 1
+    if mode_name == 'backtest':
+        start_raw = cfg_data.get('startDate')
+        end_raw = cfg_data.get('endDate')
+        try:
+            start_dt = datetime.strptime(str(start_raw), '%Y-%m-%d')
+            end_dt = datetime.strptime(str(end_raw), '%Y-%m-%d')
+            date_span_days = max(1, (end_dt - start_dt).days + 1)
+        except Exception:
+            date_span_days = 7
+
+    load_units = float(symbol_count * max(2, strike_range * 2))
+    if mode_name == 'backtest':
+        load_units *= float(date_span_days)
+    if timeframe <= 3:
+        load_units *= 1.35
+    elif timeframe >= 15:
+        load_units *= 0.8
+    if mode_name == 'live' and str(cfg_data.get('stockSelection', 'all')).strip().lower() == 'all':
+        load_units *= 0.75
+
+    if profile == 'conservative':
+        load_units *= 0.85
+    elif profile == 'aggressive':
+        load_units *= 1.20
+
+    if load_units < 120:
+        suggested = 4
+    elif load_units < 300:
+        suggested = 6
+    elif load_units < 700:
+        suggested = 8
+    elif load_units < 1200:
+        suggested = 10
+    elif load_units < 2200:
+        suggested = 12
+    else:
+        suggested = 14
+
+    cpu_ceiling = max(2, min(MAX_SCAN_WORKERS, cpu * 2))
+    workers = min(suggested, cap, cpu_ceiling)
+    if profile == 'conservative':
+        workers = max(2, workers - 1)
+    elif profile == 'aggressive':
+        workers = min(cap, cpu_ceiling, workers + 1)
+    rate_limited_recently = _recent_rate_limit_hint(user_id, mode_name)
+    if rate_limited_recently:
+        workers = max(2, workers - 2)
+    workers = max(1, min(MAX_SCAN_WORKERS, int(workers)))
+
+    detail = {
+        'enabled': True,
+        'mode': mode_name,
+        'workers': workers,
+        'cap': cap,
+        'cpu': cpu,
+        'symbols_estimate': int(symbol_count),
+        'strike_range': int(strike_range),
+        'timeframe_min': int(timeframe),
+        'date_span_days': int(date_span_days),
+        'profile': profile,
+        'load_units': int(round(load_units)),
+        'rate_limit_backoff': bool(rate_limited_recently),
+        'summary': (
+            f'Auto ({mode_name}): workers={workers}, cap={cap}, cpu={cpu}, '
+            f'symbols~{int(symbol_count)}, strikeRange={int(strike_range)}, '
+            f'timeframe={int(timeframe)}m'
+            + (f', span={int(date_span_days)}d' if mode_name == 'backtest' else '')
+            + (', backoff=rate-limit' if rate_limited_recently else '')
+        )
+    }
+    return workers, detail
 
 
 def _get_user_default_config_payload(user_id):
@@ -78,6 +240,70 @@ def _build_scanner_config(user_id, config_data, mode):
     db.session.add(config)
     db.session.commit()
     return config
+
+
+def _effective_worker_count(user_id, config_data=None, mode='live'):
+    cfg_data = config_data if isinstance(config_data, dict) else {}
+    requested = cfg_data.get('workers')
+    user = User.query.get(user_id)
+    default_cap = int(getattr(user, 'scan_workers', DEFAULT_SCAN_WORKERS) or DEFAULT_SCAN_WORKERS)
+    mode_name = 'backtest' if str(mode).lower() == 'backtest' else 'live'
+    mode_cap_attr = 'backtest_workers_cap' if mode_name == 'backtest' else 'live_workers_cap'
+    mode_cap = int(getattr(user, mode_cap_attr, default_cap) or default_cap)
+    explicit_mode_cap = cfg_data.get('backtestWorkersCap') if mode_name == 'backtest' else cfg_data.get('liveWorkersCap')
+    requested_cap = _safe_int(explicit_mode_cap, mode_cap) if explicit_mode_cap not in (None, '') else mode_cap
+    fallback = max(1, min(MAX_SCAN_WORKERS, requested_cap))
+    auto_tune_enabled = _safe_bool(
+        cfg_data.get('autoTune'),
+        default=bool(getattr(user, 'auto_tune_default', True))
+    )
+    try:
+        manual_workers = int(requested) if requested not in (None, '') else default_cap
+    except Exception:
+        manual_workers = default_cap
+    manual_workers = max(1, min(MAX_SCAN_WORKERS, manual_workers, fallback))
+
+    if auto_tune_enabled:
+        return _auto_tune_workers(user_id, cfg_data, fallback_cap=manual_workers, mode=mode)
+
+    return manual_workers, {
+        'enabled': False,
+        'mode': 'backtest' if str(mode).lower() == 'backtest' else 'live',
+        'workers': manual_workers,
+        'cap': manual_workers,
+        'summary': f'Manual: workers={manual_workers}'
+    }
+
+
+def _resolve_live_prefilter_settings(user_id, config_data=None):
+    cfg_data = config_data if isinstance(config_data, dict) else {}
+    user = User.query.get(user_id)
+    enabled_raw = cfg_data.get('livePrefilterEnabled')
+    enabled = _safe_bool(enabled_raw, default=bool(getattr(user, 'live_prefilter_default', True))) if enabled_raw is not None else bool(getattr(user, 'live_prefilter_default', True))
+    top_movers = _clamp_int(
+        cfg_data.get('livePrefilterTopMovers', getattr(user, 'live_prefilter_top_movers', 30)),
+        0,
+        500,
+        30
+    )
+    top_volume = _clamp_int(
+        cfg_data.get('livePrefilterTopVolume', getattr(user, 'live_prefilter_top_volume', 30)),
+        0,
+        500,
+        30
+    )
+    max_stocks = _clamp_int(
+        cfg_data.get('livePrefilterMaxStocks', getattr(user, 'live_prefilter_max_stocks', 50)),
+        1,
+        500,
+        50
+    )
+    return {
+        'enabled': bool(enabled),
+        'top_movers': int(top_movers),
+        'top_volume': int(top_volume),
+        'max_stocks': int(max_stocks)
+    }
 
 
 def _next_token_expiry(now=None):
@@ -195,13 +421,25 @@ def start_live_scan(app, user_id, config_data):
             return False, 'Scrip master not available. Configure ANGEL_SCRIP_MASTER_PATH or URL.'
 
         config = _build_scanner_config(user_id, config_data, mode='live')
-        engine = ScannerEngine(user_id=user_id, config=config, angel_api=angel_api)
+        worker_count, tune_detail = _effective_worker_count(user_id, config_data, mode='live')
+        prefilter = _resolve_live_prefilter_settings(user_id, config_data)
+        engine = ScannerEngine(
+            user_id=user_id,
+            config=config,
+            angel_api=angel_api,
+            workers=worker_count,
+            live_prefilter_enabled=prefilter['enabled'],
+            live_prefilter_top_movers=prefilter['top_movers'],
+            live_prefilter_top_volume=prefilter['top_volume'],
+            live_prefilter_max_stocks=prefilter['max_stocks']
+        )
         engine.is_running = True
         selected_expiries = engine.get_selected_expiries(reference_date=datetime.now())
         scripts_total = int(len(selected_expiries or {}))
         engine.last_cycle_stocks_total = scripts_total
 
         with _lock:
+            previous_status = dict(_scanner_status.get(user_id) or {})
             _live_scanners[user_id] = engine
             _scanner_status[user_id] = {
                 'running': True,
@@ -217,7 +455,17 @@ def start_live_scan(app, user_id, config_data):
                 'strikes_total': 0,
                 'timeframe': config.timeframe,
                 'price_multiplier': float(config.price_multiplier),
-                'selected_expiries': selected_expiries
+                'selected_expiries': selected_expiries,
+                'workers': worker_count,
+                'live_prefilter_enabled': bool(prefilter['enabled']),
+                'live_prefilter_top_movers': int(prefilter['top_movers']),
+                'live_prefilter_top_volume': int(prefilter['top_volume']),
+                'live_prefilter_max_stocks': int(prefilter['max_stocks']),
+                'auto_tune': bool(tune_detail.get('enabled')),
+                'auto_tune_summary': tune_detail.get('summary'),
+                'auto_tune_details': tune_detail,
+                'recent_cycles': list(previous_status.get('recent_cycles') or [])[:10],
+                'cycle_started_at': None
             }
 
         Thread(
@@ -227,7 +475,7 @@ def start_live_scan(app, user_id, config_data):
             name=f'live-scan-{user_id}'
         ).start()
 
-    return True, 'Live scanner started successfully.'
+    return True, f'Live scanner started successfully. Workers: {worker_count}. {tune_detail.get("summary", "")}'.strip()
 
 
 def _run_live_loop(app, user_id):
@@ -244,11 +492,12 @@ def _run_live_loop(app, user_id):
 def stop_live_scan(user_id):
     with _lock:
         engine = _live_scanners.get(user_id)
-        if not engine:
-            return False, 'No running scanner found.'
-        engine.stop_live_scan()
-        _live_scanners.pop(user_id, None)
         status = _scanner_status.get(user_id)
+        if engine:
+            engine.stop_live_scan()
+            _live_scanners.pop(user_id, None)
+        elif not status or not status.get('running'):
+            return False, 'No running scanner found.'
         if status:
             status['running'] = False
             status['stopped_at'] = datetime.utcnow().isoformat() + 'Z'
@@ -299,7 +548,8 @@ def start_backtest(app, user_id, config_data):
             return False, 'Scrip master not available. Configure ANGEL_SCRIP_MASTER_PATH or URL.'
 
         config = _build_scanner_config(user_id, config_data, mode='backtest')
-        engine = ScannerEngine(user_id=user_id, config=config, angel_api=angel_api)
+        worker_count, tune_detail = _effective_worker_count(user_id, config_data, mode='backtest')
+        engine = ScannerEngine(user_id=user_id, config=config, angel_api=angel_api, workers=worker_count)
         engine.is_running = True
         try:
             planned_scripts = len(engine._resolve_stock_selection())
@@ -310,6 +560,7 @@ def start_backtest(app, user_id, config_data):
         engine.last_backtest_scripts_total = scripts_total
 
         with _lock:
+            previous_status = dict(_backtest_status.get(user_id) or {})
             _backtest_jobs[user_id] = engine
             _backtest_status[user_id] = {
                 'running': True,
@@ -325,7 +576,13 @@ def start_backtest(app, user_id, config_data):
                 'to_date': to_dt.strftime('%Y-%m-%d'),
                 'timeframe': config.timeframe,
                 'price_multiplier': float(config.price_multiplier),
-                'selected_expiries': selected_expiries
+                'selected_expiries': selected_expiries,
+                'workers': worker_count,
+                'auto_tune': bool(tune_detail.get('enabled')),
+                'auto_tune_summary': tune_detail.get('summary'),
+                'auto_tune_details': tune_detail,
+                'recent_runs': list(previous_status.get('recent_runs') or [])[:10],
+                'run_started_at': datetime.utcnow().isoformat() + 'Z'
             }
 
         Thread(
@@ -335,7 +592,7 @@ def start_backtest(app, user_id, config_data):
             name=f'backtest-{user_id}'
         ).start()
 
-    return True, 'Backtest started successfully.'
+    return True, f'Backtest started successfully. Workers: {worker_count}. {tune_detail.get("summary", "")}'.strip()
 
 
 def _run_backtest(app, engine, from_dt, to_dt):
@@ -380,6 +637,11 @@ def _run_backtest(app, engine, from_dt, to_dt):
             with _lock:
                 status = _backtest_status.get(engine.user_id)
                 if status:
+                    started = _parse_iso_utc(status.get('run_started_at')) or _parse_iso_utc(status.get('started_at'))
+                    finished = _parse_iso_utc(datetime.utcnow().isoformat() + 'Z')
+                    duration_ms = 0
+                    if started and finished:
+                        duration_ms = max(0, int((finished - started).total_seconds() * 1000))
                     status['running'] = False
                     status['finished_at'] = datetime.utcnow().isoformat() + 'Z'
                     status['signals'] = persisted_count
@@ -389,6 +651,19 @@ def _run_backtest(app, engine, from_dt, to_dt):
                         _safe_int(getattr(engine, 'last_backtest_scripts_total', 0) or planned_scripts)
                     )
                     status['stopped_by_user'] = (engine.is_running is False)
+                    recent = list(status.get('recent_runs') or [])
+                    recent.insert(0, {
+                        'finished_at': status['finished_at'],
+                        'duration_ms': duration_ms,
+                        'scripts_scanned': _safe_int(status.get('scripts_scanned', 0)),
+                        'scripts_total': _safe_int(status.get('scripts_total', 0)),
+                        'signals': _safe_int(status.get('signals', 0)),
+                        'workers': _safe_int(status.get('workers', 0)),
+                        'stopped_by_user': bool(status.get('stopped_by_user', False)),
+                        'error': None
+                    })
+                    status['recent_runs'] = recent[:10]
+                    status['run_started_at'] = None
                     if persisted_count == 0:
                         status['last_error'] = None
         except Exception as e:
@@ -396,6 +671,11 @@ def _run_backtest(app, engine, from_dt, to_dt):
             with _lock:
                 status = _backtest_status.get(engine.user_id)
                 if status:
+                    started = _parse_iso_utc(status.get('run_started_at')) or _parse_iso_utc(status.get('started_at'))
+                    finished = _parse_iso_utc(datetime.utcnow().isoformat() + 'Z')
+                    duration_ms = 0
+                    if started and finished:
+                        duration_ms = max(0, int((finished - started).total_seconds() * 1000))
                     status['running'] = False
                     status['finished_at'] = datetime.utcnow().isoformat() + 'Z'
                     status['scripts_scanned'] = _safe_int(getattr(engine, 'last_backtest_scripts_scanned', 0) or 0)
@@ -404,6 +684,19 @@ def _run_backtest(app, engine, from_dt, to_dt):
                         _safe_int(getattr(engine, 'last_backtest_scripts_total', 0) or planned_scripts)
                     )
                     status['last_error'] = str(e)
+                    recent = list(status.get('recent_runs') or [])
+                    recent.insert(0, {
+                        'finished_at': status['finished_at'],
+                        'duration_ms': duration_ms,
+                        'scripts_scanned': _safe_int(status.get('scripts_scanned', 0)),
+                        'scripts_total': _safe_int(status.get('scripts_total', 0)),
+                        'signals': _safe_int(status.get('signals', 0)),
+                        'workers': _safe_int(status.get('workers', 0)),
+                        'stopped_by_user': bool(status.get('stopped_by_user', False)),
+                        'error': str(e)
+                    })
+                    status['recent_runs'] = recent[:10]
+                    status['run_started_at'] = None
         finally:
             with _lock:
                 _backtest_jobs.pop(engine.user_id, None)
@@ -438,6 +731,14 @@ def _update_live_status(
         status = _scanner_status.get(user_id)
         if not status:
             return
+        if (
+            bool(status.get('running'))
+            and stocks_scanned is not None
+            and strikes_scanned is not None
+            and _safe_int(stocks_scanned, 0) == 0
+            and _safe_int(strikes_scanned, 0) == 0
+        ):
+            status['cycle_started_at'] = datetime.utcnow().isoformat() + 'Z'
         if last_run_at:
             status['last_run_at'] = last_run_at
         if signals is not None:
@@ -455,6 +756,27 @@ def _update_live_status(
         elif last_run_at or signals is not None:
             # Clear previous error after a successful cycle update.
             status['last_error'] = None
+        if last_run_at:
+            started = _parse_iso_utc(status.get('cycle_started_at')) or _parse_iso_utc(status.get('started_at'))
+            finished = _parse_iso_utc(last_run_at) or datetime.utcnow()
+            duration_ms = 0
+            if started and finished:
+                duration_ms = max(0, int((finished - started).total_seconds() * 1000))
+            recent = list(status.get('recent_cycles') or [])
+            recent.insert(0, {
+                'completed_at': last_run_at,
+                'duration_ms': duration_ms,
+                'stocks_scanned': _safe_int(status.get('last_stocks_scanned', 0)),
+                'stocks_total': _safe_int(status.get('scripts_total', 0)),
+                'strikes_scanned': _safe_int(status.get('last_strikes_scanned', 0)),
+                'strikes_total': _safe_int(status.get('strikes_total', 0)),
+                'signals': _safe_int(status.get('last_signals', 0)),
+                'workers': _safe_int(status.get('workers', 0)),
+                'auto_tune': bool(status.get('auto_tune', False)),
+                'auto_tune_summary': status.get('auto_tune_summary')
+            })
+            status['recent_cycles'] = recent[:10]
+            status['cycle_started_at'] = None
         if (
             stocks_scanned is not None
             or stocks_total is not None

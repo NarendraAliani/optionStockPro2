@@ -20,7 +20,7 @@
 
 {% block content %}
 <div class="cards-grid">
-    <div class="mini-card card-blue">
+    <div class="mini-card card-blue card-live-scanner">
         <div class="mini-card-header">
             <i class="fas fa-broadcast-tower"></i> Live Scanner
         </div>
@@ -35,7 +35,7 @@
         </button>
     </div>
 
-    <div class="mini-card card-purple">
+    <div class="mini-card card-purple card-backtest">
         <div class="mini-card-header">
             <i class="fas fa-history"></i> Backtest
         </div>
@@ -50,7 +50,7 @@
         </button>
     </div>
 
-    <div class="mini-card card-green" id="signalsSummaryCard">
+    <div class="mini-card card-green card-signals" id="signalsSummaryCard">
         <div class="mini-card-header">
             <i class="fas fa-check-circle"></i> Signals
         </div>
@@ -60,7 +60,7 @@
         </div>
     </div>
 
-    <div class="mini-card card-orange">
+    <div class="mini-card card-orange card-scanner-config">
         <div class="mini-card-header">
             <i class="fas fa-sliders-h"></i> Scanner Config
             <a class="btn-edit-mini" href="{{ url_for('scanner.configuration') }}"><i class="fas fa-edit"></i></a>
@@ -70,7 +70,57 @@
         </div>
     </div>
 
-    <div class="mini-card card-cyan">
+    <div class="mini-card card-live-cycles">
+        <div class="mini-card-header">
+            <i class="fas fa-wave-square"></i> Live Recent Cycles (latest 10)
+        </div>
+        <div class="mini-card-body">
+            <div class="table-responsive">
+                <table class="table table-sm table-striped mb-0 perf-table">
+                    <thead>
+                        <tr>
+                            <th>Time</th>
+                            <th>Duration</th>
+                            <th>Stocks</th>
+                            <th>Strikes</th>
+                            <th>Signals</th>
+                            <th>Workers</th>
+                        </tr>
+                    </thead>
+                    <tbody id="livePerfRows">
+                        <tr><td colspan="6" class="text-muted">No live cycle data yet.</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <div class="mini-card card-backtest-runs">
+        <div class="mini-card-header">
+            <i class="fas fa-history"></i> Backtest Recent Runs (latest 10)
+        </div>
+        <div class="mini-card-body">
+            <div class="table-responsive">
+                <table class="table table-sm table-striped mb-0 perf-table">
+                    <thead>
+                        <tr>
+                            <th>Time</th>
+                            <th>Duration</th>
+                            <th>Scripts</th>
+                            <th>Signals</th>
+                            <th>Workers</th>
+                            <th>Status</th>
+                        </tr>
+                    </thead>
+                    <tbody id="backtestPerfRows">
+                        <tr><td colspan="6" class="text-muted">No backtest run data yet.</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <div class="mini-card card-cyan card-live-status">
         <div class="mini-card-header">
             <i class="fas fa-wave-square"></i> Live Status
         </div>
@@ -81,13 +131,14 @@
             <div class="mini-stat"><span>Last run:</span> <span class="text-small" id="liveLastRun">--</span></div>
             <div class="mini-stat"><span>Scripts scanned:</span> <span id="liveScriptsScanned">0</span></div>
             <div class="mini-stat"><span>Strikes scanned:</span> <span id="liveStrikesScanned">0</span></div>
+            <div class="mini-stat"><span>Workers:</span> <span id="liveWorkers">--</span></div>
             <div class="mini-stat"><span>Generated:</span> <span id="liveSignalsGenerated">0</span></div>
             <div class="mini-stat"><span>Note:</span> <span class="text-small" id="liveProcessNote">Scanner is idle.</span></div>
             <div class="mini-stat"><span>Error:</span> <span class="text-small text-danger" id="liveLastError" style="display:none;"></span></div>
         </div>
     </div>
 
-    <div class="mini-card card-pink">
+    <div class="mini-card card-pink card-backtest-status">
         <div class="mini-card-header">
             <i class="fas fa-layer-group"></i> Backtest Status
         </div>
@@ -97,6 +148,7 @@
             <div class="mini-stat"><span>Finished:</span> <span class="text-small" id="backtestFinishedAt">--</span></div>
             <div class="mini-stat"><span>Signals:</span> <span id="backtestSignalsGenerated">0</span></div>
             <div class="mini-stat"><span>Scripts scanned:</span> <span id="backtestScriptsScanned">0</span></div>
+            <div class="mini-stat"><span>Workers:</span> <span id="backtestWorkers">--</span></div>
             <div class="mini-stat"><span>Note:</span> <span class="text-small" id="backtestProcessNote">Backtest is idle.</span></div>
             <div class="mini-stat"><span>Error:</span> <span class="text-small text-danger" id="backtestLastError" style="display:none;"></span></div>
         </div>
@@ -201,6 +253,24 @@
                     <input type="text" class="form-control" id="liveTotpCode" placeholder="Enter 6-digit code">
                     <small class="text-muted">If 2FA is enabled, enter the current 6-digit TOTP code.</small>
                 </div>
+                <div class="form-check mb-2">
+                    <input class="form-check-input" type="checkbox" id="liveAutoTune" checked>
+                    <label class="form-check-label" for="liveAutoTune">Auto tune workers</label>
+                </div>
+                <div class="mb-2">
+                    <label for="liveWorkersCapOverride" class="form-label">Live Workers Cap (run override)</label>
+                    <input type="number" class="form-control" id="liveWorkersCapOverride" min="1" max="16" value="8">
+                </div>
+                <div class="small text-muted mb-2" id="liveAutoTuneHint">
+                    Auto mode uses workload, timeframe, strike range, date span and CPU to pick workers.
+                </div>
+                <div class="form-check mb-2">
+                    <input class="form-check-input" type="checkbox" id="livePrefilterEnabled" checked>
+                    <label class="form-check-label" for="livePrefilterEnabled">Live pre-filter (faster, scans shortlist)</label>
+                </div>
+                <div class="small text-muted mb-2" id="livePrefilterHint">
+                    Turn OFF to scan full selected stock universe each cycle.
+                </div>
                 <div class="small mt-2" id="liveConnectStatus">
                     <span class="text-muted">Step 1: Connect with TOTP before fetching live stocks.</span>
                 </div>
@@ -242,6 +312,17 @@
                         <input type="text" class="form-control" id="btTotpCode" placeholder="Enter 6-digit code">
                         <small class="text-muted">If 2FA is enabled, enter the current 6-digit TOTP code.</small>
                     </div>
+                    <div class="form-check mb-2">
+                        <input class="form-check-input" type="checkbox" id="backtestAutoTune" checked>
+                        <label class="form-check-label" for="backtestAutoTune">Auto tune workers</label>
+                    </div>
+                    <div class="mb-2">
+                        <label for="backtestWorkersCapOverride" class="form-label">Backtest Workers Cap (run override)</label>
+                        <input type="number" class="form-control" id="backtestWorkersCapOverride" min="1" max="16" value="8">
+                    </div>
+                    <div class="small text-muted mb-2" id="backtestAutoTuneHint">
+                        Auto mode uses workload, timeframe, strike range, date span and CPU to pick workers.
+                    </div>
                     <div class="small mt-2" id="btConnectStatus">
                         <span class="text-muted">Step 1: Connect with TOTP before fetching.</span>
                     </div>
@@ -271,7 +352,10 @@
         strikeRange: 5,
         priceMultiplier: 2,
         timeframe: 5,
-        refreshInterval: 5
+        refreshInterval: 5,
+        workers: 8,
+        autoTune: true,
+        livePrefilterEnabled: true
     };
     let latestSignalCounts = { live: 0, backtest: 0, total: 0 };
     let activeConfigIds = { live: null, backtest: null };
@@ -655,6 +739,9 @@
     function openLiveModal() {
         const modal = new bootstrap.Modal(document.getElementById('liveModal'));
         $('#liveTotpCode').val('');
+        $('#liveAutoTune').prop('checked', scannerConfig.autoTune !== false);
+        $('#livePrefilterEnabled').prop('checked', scannerConfig.livePrefilterEnabled !== false);
+        $('#liveWorkersCapOverride').val(Number(scannerConfig.liveWorkersCap || scannerConfig.workers || 8));
         liveAuthReady = false;
         setLiveAuthState(false, 'Step 1: Connect with TOTP before fetching live stocks.', false);
         modal.show();
@@ -721,6 +808,25 @@
 
     function startLiveScanner() {
         const config = Object.assign({}, scannerConfig);
+        config.autoTune = $('#liveAutoTune').is(':checked');
+        config.livePrefilterEnabled = $('#livePrefilterEnabled').is(':checked');
+        config.liveWorkersCap = Number($('#liveWorkersCapOverride').val() || scannerConfig.liveWorkersCap || scannerConfig.workers || 8);
+        config.workers = Number(scannerConfig.workers || 8);
+        config.guardrailEnabled = scannerConfig.guardrailEnabled !== false;
+        config.guardrailLoadThreshold = Number(scannerConfig.guardrailLoadThreshold || 1200);
+        config.scanProfile = scannerConfig.scanProfile || 'balanced';
+        config.liveWorkersCap = Number(scannerConfig.liveWorkersCap || scannerConfig.workers || 8);
+
+        const liveEstimate = estimateLoadUnits(config, 'live');
+        if (config.guardrailEnabled && liveEstimate > Number(config.guardrailLoadThreshold || 1200)) {
+            const proceed = confirm(
+                'Heavy live run detected.\n' +
+                'Estimated load: ' + liveEstimate + '\n' +
+                'Threshold: ' + Number(config.guardrailLoadThreshold || 1200) + '\n' +
+                'Proceed anyway?'
+            );
+            if (!proceed) return;
+        }
 
         // Show loading state
         const btn = $('#btnStartLive');
@@ -841,6 +947,8 @@
         $('#btStartDate').val(startDate);
         $('#btEndDate').val(endDate);
         $('#btTotpCode').val('');
+        $('#backtestAutoTune').prop('checked', scannerConfig.autoTune !== false);
+        $('#backtestWorkersCapOverride').val(Number(scannerConfig.backtestWorkersCap || scannerConfig.workers || 8));
         backtestAuthReady = false;
         setBacktestAuthState(false, 'Step 1: Connect with TOTP before fetching.', false);
 
@@ -946,9 +1054,26 @@
         }
 
         const config = Object.assign({}, scannerConfig);
+        config.autoTune = $('#backtestAutoTune').is(':checked');
+        config.backtestWorkersCap = Number($('#backtestWorkersCapOverride').val() || scannerConfig.backtestWorkersCap || scannerConfig.workers || 8);
+        config.workers = Number(scannerConfig.workers || 8);
         config.startDate = startDate;
         config.endDate = endDate;
         config.clearPrevious = true;
+        config.guardrailEnabled = scannerConfig.guardrailEnabled !== false;
+        config.guardrailLoadThreshold = Number(scannerConfig.guardrailLoadThreshold || 1200);
+        config.scanProfile = scannerConfig.scanProfile || 'balanced';
+        config.backtestWorkersCap = Number(scannerConfig.backtestWorkersCap || scannerConfig.workers || 8);
+        const backtestEstimate = estimateLoadUnits(config, 'backtest', startDate, endDate);
+        if (config.guardrailEnabled && backtestEstimate > Number(config.guardrailLoadThreshold || 1200)) {
+            const proceed = confirm(
+                'Heavy backtest run detected.\n' +
+                'Estimated load: ' + backtestEstimate + '\n' +
+                'Threshold: ' + Number(config.guardrailLoadThreshold || 1200) + '\n' +
+                'Proceed anyway?'
+            );
+            if (!proceed) return;
+        }
         backtestObservedScanned = 0;
         backtestObservedTotal = 0;
         backtestObservedSignals = 0;
@@ -987,6 +1112,9 @@
                         to_date: endDate,
                         timeframe: String(scannerConfig.timeframe || 5) + 'min',
                         price_multiplier: scannerConfig.priceMultiplier,
+                        workers: Number(scannerConfig.workers || 8),
+                        auto_tune: config.autoTune === true,
+                        auto_tune_summary: config.autoTune === true ? 'Auto mode enabled' : 'Manual mode',
                         signals: latestSignalCounts.backtest || 0,
                         scripts_scanned: 0,
                         scripts_total: 0,
@@ -1030,6 +1158,7 @@
 
                 updateStatusUI('live', live);
                 updateStatusUI('backtest', backtest);
+                updatePerformancePanels(live, backtest);
 
                 const now = new Date().toLocaleTimeString(IST_LOCALE, {
                     timeZone: IST_TIMEZONE,
@@ -1155,10 +1284,98 @@
             ', Timeframe: ' + scannerConfig.timeframe + 'm' +
             ', Strike Range: ' + scannerConfig.strikeRange +
             ', Multiplier: ' + scannerConfig.priceMultiplier +
-            ', Refresh: ' + scannerConfig.refreshInterval + 'm';
+            ', Refresh: ' + scannerConfig.refreshInterval + 'm' +
+            ', Workers Cap: ' + Number(scannerConfig.workers || 8) +
+            ', Profile: ' + String(scannerConfig.scanProfile || 'balanced') +
+            ', Auto Tune: ' + (scannerConfig.autoTune === false ? 'Off' : 'On') +
+            ', Live Pre-filter: ' + (scannerConfig.livePrefilterEnabled === false ? 'Off' : 'On');
         $('#configSummaryText').text(text);
         $('#liveConfigSummary').text(text);
         $('#backtestConfigSummary').text(text);
+    }
+
+    function estimateStockUniverse(config) {
+        const selection = config && config.stockSelection;
+        if (Array.isArray(selection)) return Math.max(1, selection.length);
+        const token = String(selection || 'all').toLowerCase();
+        if (token === 'all') return 207;
+        if (token === 'nifty50') return 50;
+        if (token === 'banknifty') return 1;
+        return 1;
+    }
+
+    function estimateLoadUnits(config, mode, startDate, endDate) {
+        const stocks = estimateStockUniverse(config || {});
+        const strikeRange = Math.max(1, Number((config || {}).strikeRange || 5));
+        const timeframe = Math.max(1, Number((config || {}).timeframe || 5));
+        let days = 1;
+        if (mode === 'backtest' && startDate && endDate) {
+            const s = new Date(startDate + 'T00:00:00');
+            const e = new Date(endDate + 'T00:00:00');
+            const diff = Math.floor((e.getTime() - s.getTime()) / (24 * 60 * 60 * 1000)) + 1;
+            days = Math.max(1, isFinite(diff) ? diff : 7);
+        }
+        let load = stocks * Math.max(2, strikeRange * 2);
+        if (mode === 'backtest') load *= days;
+        if (timeframe <= 3) load *= 1.35;
+        if (timeframe >= 15) load *= 0.8;
+        if (mode === 'live' && String((config || {}).stockSelection || 'all').toLowerCase() === 'all' && (config || {}).livePrefilterEnabled !== false) {
+            load *= 0.75;
+        }
+        const profile = String((config || {}).scanProfile || 'balanced').toLowerCase();
+        if (profile === 'conservative') load *= 0.85;
+        if (profile === 'aggressive') load *= 1.20;
+        return Math.round(load);
+    }
+
+    function formatDuration(ms) {
+        const num = Number(ms || 0);
+        if (!isFinite(num) || num <= 0) return '--';
+        if (num < 1000) return num + 'ms';
+        const sec = Math.round(num / 100) / 10;
+        return sec + 's';
+    }
+
+    function updatePerformancePanels(live, backtest) {
+        const liveRows = Array.isArray((live || {}).recent_cycles) ? live.recent_cycles : [];
+        const btRows = Array.isArray((backtest || {}).recent_runs) ? backtest.recent_runs : [];
+
+        const liveBody = $('#livePerfRows');
+        const btBody = $('#backtestPerfRows');
+
+        if (!liveRows.length) {
+            liveBody.html('<tr><td colspan="6" class="text-muted">No live cycle data yet.</td></tr>');
+        } else {
+            const html = liveRows.slice(0, 10).map(function(row) {
+                return '<tr>' +
+                    '<td>' + formatTime(row.completed_at) + '</td>' +
+                    '<td>' + formatDuration(row.duration_ms) + '</td>' +
+                    '<td>' + Number(row.stocks_scanned || 0) + ' / ' + Number(row.stocks_total || 0) + '</td>' +
+                    '<td>' + Number(row.strikes_scanned || 0) + ' / ' + Number(row.strikes_total || 0) + '</td>' +
+                    '<td>' + Number(row.signals || 0) + '</td>' +
+                    '<td>' + Number(row.workers || 0) + '</td>' +
+                    '</tr>';
+            }).join('');
+            liveBody.html(html);
+        }
+
+        if (!btRows.length) {
+            btBody.html('<tr><td colspan="6" class="text-muted">No backtest run data yet.</td></tr>');
+        } else {
+            const html = btRows.slice(0, 10).map(function(row) {
+                const status = row.error ? 'Error' : (row.stopped_by_user ? 'Stopped' : 'Done');
+                const statusClass = row.error ? 'is-error' : (row.stopped_by_user ? 'is-stopped' : 'is-done');
+                return '<tr>' +
+                    '<td>' + formatTime(row.finished_at || row.completed_at) + '</td>' +
+                    '<td>' + formatDuration(row.duration_ms) + '</td>' +
+                    '<td>' + Number(row.scripts_scanned || 0) + ' / ' + Number(row.scripts_total || 0) + '</td>' +
+                    '<td>' + Number(row.signals || 0) + '</td>' +
+                    '<td>' + Number(row.workers || 0) + '</td>' +
+                    '<td><span class="perf-status-badge ' + statusClass + '">' + status + '</span></td>' +
+                    '</tr>';
+            }).join('');
+            btBody.html(html);
+        }
     }
 
     function _signalsUrlForMode(mode) {
@@ -1459,6 +1676,19 @@
         return number.toFixed(2).replace(/\.?0+$/, '');
     }
 
+    function formatWorkers(value) {
+        const workers = Number(value);
+        if (!isFinite(workers) || workers <= 0) return '--';
+        return String(Math.trunc(workers));
+    }
+
+    function formatAutoTuneSuffix(data) {
+        if (!data || data.auto_tune !== true) return '';
+        const summary = String(data.auto_tune_summary || ((data.auto_tune_details || {}).summary) || 'enabled').trim();
+        if (!summary) return ' Auto-tune enabled.';
+        return ' ' + summary + '.';
+    }
+
     function updateStatusUI(type, data) {
         const running = data.running === true;
         const badge = $('#' + type + 'StatusBadge');
@@ -1489,8 +1719,11 @@
             const total = Number(data.scripts_total || 0);
             const strikesScanned = Number(data.last_strikes_scanned || 0);
             const strikesTotal = Number(data.strikes_total || 0);
+            const workers = formatWorkers(data.workers);
+            const autoTuneSuffix = formatAutoTuneSuffix(data);
             $('#liveScriptsScanned').text(total > 0 ? (scanned + ' / ' + total) : String(scanned));
             $('#liveStrikesScanned').text(strikesTotal > 0 ? (strikesScanned + ' / ' + strikesTotal) : String(strikesScanned));
+            $('#liveWorkers').text(workers);
             $('#liveSignalsGenerated').text(Number(data.last_signals || 0));
             if (running) {
                 if (data.last_run_at) {
@@ -1500,12 +1733,12 @@
                         $('#liveProcessNote')
                             .removeClass('text-muted text-warning text-success text-danger')
                             .addClass('text-success')
-                            .text('Scanner processed latest cycle and found ' + (data.last_signals || 0) + ' signal(s). Stocks scanned: ' + stocksScanned + '. Strikes scanned: ' + strikesScannedDone + '.');
+                            .text('Scanner processed latest cycle and found ' + (data.last_signals || 0) + ' signal(s). Stocks scanned: ' + stocksScanned + '. Strikes scanned: ' + strikesScannedDone + '. Workers: ' + workers + '.' + autoTuneSuffix);
                     } else {
                         $('#liveProcessNote')
                             .removeClass('text-muted text-warning text-success text-danger')
                             .addClass('text-warning')
-                            .text('Scanner is running. Latest cycle completed: no signal generated. Stocks scanned: ' + stocksScanned + '. Strikes scanned: ' + strikesScannedDone + '.');
+                            .text('Scanner is running. Latest cycle completed: no signal generated. Stocks scanned: ' + stocksScanned + '. Strikes scanned: ' + strikesScannedDone + '. Workers: ' + workers + '.' + autoTuneSuffix);
                     }
                 } else {
                     const stocksScanned = Number(data.last_stocks_scanned || 0);
@@ -1521,7 +1754,7 @@
                     $('#liveProcessNote')
                         .removeClass('text-muted text-warning text-success text-danger')
                         .addClass('text-warning')
-                        .html('<span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>Scanner is processing... Stocks scanned: ' + scannedDisplay + '. Strikes scanned: ' + strikesDisplay + '.');
+                        .html('<span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>Scanner is processing... Stocks scanned: ' + scannedDisplay + '. Strikes scanned: ' + strikesDisplay + '. Workers: ' + workers + '.' + autoTuneSuffix);
                 }
             } else {
                 const stocksScanned = Number(data.last_stocks_scanned || 0);
@@ -1582,6 +1815,8 @@
             const scanned = Number(data.scripts_scanned || 0);
             const total = Number(data.scripts_total || 0);
             const signals = Number(data.signals || 0);
+            const workers = formatWorkers(data.workers);
+            const autoTuneSuffix = formatAutoTuneSuffix(data);
             backtestObservedScanned = Math.max(backtestObservedScanned, isFinite(scanned) ? scanned : 0);
             backtestObservedTotal = Math.max(backtestObservedTotal, isFinite(total) ? total : 0);
             backtestObservedSignals = Math.max(backtestObservedSignals, isFinite(signals) ? signals : 0);
@@ -1590,12 +1825,16 @@
                     ? (backtestObservedScanned + ' / ' + backtestObservedTotal)
                     : String(backtestObservedScanned)
             );
+            $('#backtestWorkers').text(workers);
             $('#backtestSignalsGenerated').text(backtestObservedSignals);
             if (running) {
+                const scannedDisplay = backtestObservedTotal > 0
+                    ? (backtestObservedScanned + ' / ' + backtestObservedTotal)
+                    : String(backtestObservedScanned);
                 $('#backtestProcessNote')
                     .removeClass('text-muted text-success text-danger')
                     .addClass('text-warning')
-                    .html('<span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>Backtest is processing historical candles...');
+                    .html('<span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>Backtest is processing historical candles... Scripts scanned: ' + scannedDisplay + '. Workers: ' + workers + '.' + autoTuneSuffix);
                 $('#btnStartBacktest')
                     .removeClass('btn-primary')
                     .addClass('btn-danger')

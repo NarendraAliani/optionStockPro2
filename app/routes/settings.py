@@ -28,6 +28,54 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 
 settings_bp = Blueprint('settings', __name__)
+DEFAULT_SCAN_WORKERS = 8
+MAX_SCAN_WORKERS = 16
+DEFAULT_PROFILE = 'balanced'
+VALID_SCAN_PROFILES = ('conservative', 'balanced', 'aggressive')
+
+
+def _clamp_scan_workers(value, default=DEFAULT_SCAN_WORKERS):
+    try:
+        workers = int(value)
+    except Exception:
+        workers = default
+    return max(1, min(MAX_SCAN_WORKERS, workers))
+
+
+def _coerce_bool(value, default=False):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def _form_bool(form, name, default=False):
+    values = form.getlist(name)
+    if not values:
+        return default
+    return _coerce_bool(values[-1], default=default)
+
+
+def _clamp_int(value, minimum, maximum, default):
+    try:
+        num = int(value)
+    except Exception:
+        num = default
+    return max(minimum, min(maximum, num))
+
+
+def _normalized_profile(value):
+    token = str(value or DEFAULT_PROFILE).strip().lower()
+    if token not in VALID_SCAN_PROFILES:
+        return DEFAULT_PROFILE
+    return token
+
+
+def _suggested_scan_workers():
+    cpu = os.cpu_count() or DEFAULT_SCAN_WORKERS
+    # API-bound workload: keep recommendation moderate to avoid rate-limit pressure.
+    return max(DEFAULT_SCAN_WORKERS, min(MAX_SCAN_WORKERS, cpu * 2))
 
 
 class APICredentialForm(FlaskForm):
@@ -481,12 +529,42 @@ def preferences():
     """User preferences"""
     if request.method == 'POST':
         theme = request.form.get('theme', 'light')
+        scan_workers = _clamp_scan_workers(request.form.get('scan_workers', DEFAULT_SCAN_WORKERS))
+        live_workers_cap = _clamp_scan_workers(request.form.get('live_workers_cap', scan_workers), default=scan_workers)
+        backtest_workers_cap = _clamp_scan_workers(request.form.get('backtest_workers_cap', scan_workers), default=scan_workers)
+        scan_profile = _normalized_profile(request.form.get('scan_profile', DEFAULT_PROFILE))
+        auto_tune_default = _form_bool(request.form, 'auto_tune_default', default=True)
+        live_prefilter_default = _form_bool(request.form, 'live_prefilter_default', default=True)
+        live_prefilter_top_movers = _clamp_int(request.form.get('live_prefilter_top_movers'), 0, 500, 30)
+        live_prefilter_top_volume = _clamp_int(request.form.get('live_prefilter_top_volume'), 0, 500, 30)
+        live_prefilter_max_stocks = _clamp_int(request.form.get('live_prefilter_max_stocks'), 1, 500, 50)
+        guardrail_enabled = _form_bool(request.form, 'guardrail_enabled', default=True)
+        guardrail_load_threshold = _clamp_int(request.form.get('guardrail_load_threshold'), 100, 25000, 1200)
         current_user.theme_preference = theme
+        current_user.scan_workers = scan_workers
+        current_user.live_workers_cap = live_workers_cap
+        current_user.backtest_workers_cap = backtest_workers_cap
+        current_user.scan_profile = scan_profile
+        current_user.auto_tune_default = auto_tune_default
+        current_user.live_prefilter_default = live_prefilter_default
+        current_user.live_prefilter_top_movers = live_prefilter_top_movers
+        current_user.live_prefilter_top_volume = live_prefilter_top_volume
+        current_user.live_prefilter_max_stocks = live_prefilter_max_stocks
+        current_user.guardrail_enabled = guardrail_enabled
+        current_user.guardrail_load_threshold = guardrail_load_threshold
         db.session.commit()
         flash('Preferences updated!', 'success')
         return redirect(url_for('dashboard.index'))
     
-    return render_template('settings/preferences.html', user=current_user)
+    return render_template(
+        'settings/preferences.html',
+        user=current_user,
+        default_scan_workers=DEFAULT_SCAN_WORKERS,
+        max_scan_workers=MAX_SCAN_WORKERS,
+        suggested_scan_workers=_suggested_scan_workers(),
+        default_profile=DEFAULT_PROFILE,
+        scan_profiles=VALID_SCAN_PROFILES
+    )
 
 
 @settings_bp.route('/preferences/sound', methods=['GET'])

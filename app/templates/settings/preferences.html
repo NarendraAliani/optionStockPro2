@@ -3,14 +3,18 @@
 {% block title %}Preferences - Options Signal Scanner Pro{% endblock %}
 
 {% block content %}
-<div class="row">
-    <div class="col-md-8 offset-md-2">
-        <h2 class="mb-4">
-            <i class="bi bi-sliders"></i> User Preferences
-        </h2>
-        
-        <div class="card">
-            <div class="card-body">
+<div class="preferences-container">
+    <div class="preferences-header">
+        <h1 class="preferences-title">
+            <i class="fas fa-sliders-h"></i> User Preferences
+        </h1>
+    </div>
+
+    <div class="preferences-card">
+        <div class="preferences-card-header">
+            <i class="fas fa-cogs"></i> Scanner Runtime Defaults
+        </div>
+        <div class="preferences-card-body">
                 <form method="POST" action="{{ url_for('settings.preferences') }}">
                     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
                     <div class="mb-3">
@@ -20,18 +24,154 @@
                             <option value="dark" {% if user.theme_preference == 'dark' %}selected{% endif %}>Dark</option>
                         </select>
                     </div>
+
+                    <div class="mb-3">
+                        <label for="scan_workers" class="form-label">Scanner Workers</label>
+                        <input
+                            type="number"
+                            class="form-control"
+                            id="scan_workers"
+                            name="scan_workers"
+                            min="1"
+                            max="{{ max_scan_workers }}"
+                            value="{{ user.scan_workers or default_scan_workers }}"
+                        >
+                        <small class="text-muted">
+                            Default: {{ default_scan_workers }}. Suggested maximum on this machine: {{ suggested_scan_workers }}.
+                            Hard limit: {{ max_scan_workers }}.
+                        </small>
+                    </div>
+
+                    <div class="mb-3">
+                        <label for="scan_profile" class="form-label">Performance Profile</label>
+                        <select class="form-select" id="scan_profile" name="scan_profile">
+                            {% set active_profile = user.scan_profile or default_profile %}
+                            {% for profile in scan_profiles %}
+                                <option value="{{ profile }}" {% if active_profile == profile %}selected{% endif %}>
+                                    {{ profile|capitalize }}
+                                </option>
+                            {% endfor %}
+                        </select>
+                        <small class="text-muted">
+                            Conservative lowers load, Balanced is default, Aggressive favors speed.
+                        </small>
+                    </div>
+
+                    <div class="row">
+                        <div class="col-md-6 mb-3">
+                            <label for="live_workers_cap" class="form-label">Live Workers Cap</label>
+                            <input
+                                type="number"
+                                class="form-control"
+                                id="live_workers_cap"
+                                name="live_workers_cap"
+                                min="1"
+                                max="{{ max_scan_workers }}"
+                                value="{{ user.live_workers_cap or user.scan_workers or default_scan_workers }}"
+                            >
+                        </div>
+                        <div class="col-md-6 mb-3">
+                            <label for="backtest_workers_cap" class="form-label">Backtest Workers Cap</label>
+                            <input
+                                type="number"
+                                class="form-control"
+                                id="backtest_workers_cap"
+                                name="backtest_workers_cap"
+                                min="1"
+                                max="{{ max_scan_workers }}"
+                                value="{{ user.backtest_workers_cap or user.scan_workers or default_scan_workers }}"
+                            >
+                        </div>
+                    </div>
+
+                    <div class="form-check form-switch mb-3">
+                        <input type="hidden" name="auto_tune_default" value="0">
+                        <input class="form-check-input" type="checkbox" id="auto_tune_default" name="auto_tune_default" value="1" {% if user.auto_tune_default is not sameas false %}checked{% endif %}>
+                        <label class="form-check-label" for="auto_tune_default">Auto Tune Enabled By Default</label>
+                    </div>
+
+                    <div class="form-check form-switch mb-3">
+                        <input type="hidden" name="live_prefilter_default" value="0">
+                        <input class="form-check-input" type="checkbox" id="live_prefilter_default" name="live_prefilter_default" value="1" {% if user.live_prefilter_default is not sameas false %}checked{% endif %}>
+                        <label class="form-check-label" for="live_prefilter_default">Live Pre-filter Enabled By Default</label>
+                    </div>
+
+                    <div class="row">
+                        <div class="col-md-4 mb-3">
+                            <label for="live_prefilter_top_movers" class="form-label">Pre-filter Top Movers</label>
+                            <input
+                                type="number"
+                                class="form-control"
+                                id="live_prefilter_top_movers"
+                                name="live_prefilter_top_movers"
+                                min="0"
+                                max="500"
+                                value="{{ user.live_prefilter_top_movers or 30 }}"
+                            >
+                        </div>
+                        <div class="col-md-4 mb-3">
+                            <label for="live_prefilter_top_volume" class="form-label">Pre-filter Top Volume</label>
+                            <input
+                                type="number"
+                                class="form-control"
+                                id="live_prefilter_top_volume"
+                                name="live_prefilter_top_volume"
+                                min="0"
+                                max="500"
+                                value="{{ user.live_prefilter_top_volume or 30 }}"
+                            >
+                        </div>
+                        <div class="col-md-4 mb-3">
+                            <label for="live_prefilter_max_stocks" class="form-label">Pre-filter Max Stocks</label>
+                            <input
+                                type="number"
+                                class="form-control"
+                                id="live_prefilter_max_stocks"
+                                name="live_prefilter_max_stocks"
+                                min="1"
+                                max="500"
+                                value="{{ user.live_prefilter_max_stocks or 50 }}"
+                            >
+                        </div>
+                    </div>
+
+                    <div class="form-check form-switch mb-3">
+                        <input type="hidden" name="guardrail_enabled" value="0">
+                        <input class="form-check-input" type="checkbox" id="guardrail_enabled" name="guardrail_enabled" value="1" {% if user.guardrail_enabled is not sameas false %}checked{% endif %}>
+                        <label class="form-check-label" for="guardrail_enabled">Enable Heavy Run Guardrails</label>
+                    </div>
+
+                    <div class="mb-3">
+                        <label for="guardrail_load_threshold" class="form-label">Guardrail Load Threshold</label>
+                        <input
+                            type="number"
+                            class="form-control"
+                            id="guardrail_load_threshold"
+                            name="guardrail_load_threshold"
+                            min="100"
+                            max="25000"
+                            value="{{ user.guardrail_load_threshold or 1200 }}"
+                        >
+                        <small class="text-muted">
+                            When estimated load exceeds this, UI shows a confirmation warning before start.
+                        </small>
+                    </div>
                     
                     <div class="d-grid gap-2">
-                        <button type="submit" class="btn btn-primary">Save Preferences</button>
+                        <button type="submit" class="btn-save-config">
+                            <i class="fas fa-save me-2"></i>Save Preferences
+                        </button>
                         <a href="{{ url_for('dashboard.index') }}" class="btn btn-outline-secondary">Cancel</a>
                     </div>
                 </form>
-            </div>
         </div>
+    </div>
 
-        <div class="card mt-4">
-            <div class="card-body">
-                <h5 class="mb-3"><i class="bi bi-volume-up me-2"></i>Notification Sound</h5>
+    <div class="preferences-card">
+        <div class="preferences-card-header preferences-card-header-alt">
+            <i class="fas fa-volume-up"></i> Notification Sound
+        </div>
+        <div class="preferences-card-body">
                 <div class="mb-3">
                     <label for="soundSource" class="form-label">Sound Source</label>
                     <select class="form-select" id="soundSource">
@@ -51,7 +191,6 @@
                     <button type="button" class="btn btn-outline-secondary" id="btnClearCustomSound">Clear Custom Sound</button>
                 </div>
                 <div class="small mt-2 text-muted" id="soundPrefStatus"></div>
-            </div>
         </div>
     </div>
 </div>

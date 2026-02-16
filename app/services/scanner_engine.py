@@ -8,6 +8,8 @@ from app.models.signal import Signal
 from app.models.signal_detail import SignalDetail
 from app import db, socketio
 from datetime import datetime, date, timezone, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Event, Lock
 import os
 import logging
 import re
@@ -30,7 +32,17 @@ class ScannerEngine:
         'TITAN', 'TRENT', 'ULTRACEMCO', 'WIPRO'
     ]
     
-    def __init__(self, user_id, config, angel_api):
+    def __init__(
+        self,
+        user_id,
+        config,
+        angel_api,
+        workers=8,
+        live_prefilter_enabled=None,
+        live_prefilter_top_movers=None,
+        live_prefilter_top_volume=None,
+        live_prefilter_max_stocks=None
+    ):
         """
         Initialize scanner engine
         
@@ -58,15 +70,29 @@ class ScannerEngine:
         self._stock_selection_cache = None
         self._stock_selection_cache_day = None
         self._has_signal_details_table = None
-        self._prefilter_enabled = str(os.getenv('LIVE_PREFILTER_ENABLED', 'true')).strip().lower() in ('1', 'true', 'yes', 'on')
-        self._prefilter_top_movers = self._safe_int(os.getenv('LIVE_PREFILTER_TOP_MOVERS', '30'), 30)
-        self._prefilter_top_volume = self._safe_int(os.getenv('LIVE_PREFILTER_TOP_VOLUME', '30'), 30)
-        self._prefilter_max_stocks = self._safe_int(os.getenv('LIVE_PREFILTER_MAX_STOCKS', '50'), 50)
+        env_prefilter_enabled = str(os.getenv('LIVE_PREFILTER_ENABLED', 'true')).strip().lower() in ('1', 'true', 'yes', 'on')
+        self._prefilter_enabled = env_prefilter_enabled if live_prefilter_enabled is None else bool(live_prefilter_enabled)
+        self._prefilter_top_movers = self._safe_int(
+            live_prefilter_top_movers if live_prefilter_top_movers is not None else os.getenv('LIVE_PREFILTER_TOP_MOVERS', '30'),
+            30
+        )
+        self._prefilter_top_volume = self._safe_int(
+            live_prefilter_top_volume if live_prefilter_top_volume is not None else os.getenv('LIVE_PREFILTER_TOP_VOLUME', '30'),
+            30
+        )
+        self._prefilter_max_stocks = self._safe_int(
+            live_prefilter_max_stocks if live_prefilter_max_stocks is not None else os.getenv('LIVE_PREFILTER_MAX_STOCKS', '50'),
+            50
+        )
         self._candle_close_delay_seconds = self._safe_int(os.getenv('LIVE_CANDLE_CLOSE_DELAY_SECONDS', '8'), 8)
+        self.max_workers = max(1, min(16, self._safe_int(workers, 8)))
+        self._stop_event = Event()
+        self._live_signal_lock = Lock()
     
     def start_live_scan(self):
         """Start live scanning"""
         self.is_running = True
+        self._stop_event.clear()
         logger.info(f'Starting live scan for user {self.user_id} with config {self.config_id}')
         
         self.run_live_loop()
@@ -74,21 +100,25 @@ class ScannerEngine:
     def stop_live_scan(self):
         """Stop live scanning"""
         self.is_running = False
+        self._stop_event.set()
         logger.info(f'Stopped live scan for user {self.user_id}')
 
     def stop_backtest(self):
         """Stop running backtest gracefully."""
         self.is_running = False
+        self._stop_event.set()
         logger.info(f'Stopped backtest for user {self.user_id}')
 
     def run_live_loop(self, status_callback=None):
         """Background live scan loop"""
         refresh_interval = int(self.config.refresh_interval or 300)
         timeframe = self._normalize_timeframe()
-        while self.is_running:
+        self._stop_event.clear()
+        while self.is_running and not self._stop_event.is_set():
             is_new_candle, candle_slot = self._claim_live_candle_slot(timeframe)
             if not is_new_candle:
-                socketio.sleep(min(refresh_interval, 10))
+                if self._wait_with_abort(min(refresh_interval, 10)):
+                    break
                 continue
             try:
                 signals = self.scan_once(progress_callback=status_callback, reference_time=candle_slot)
@@ -114,11 +144,11 @@ class ScannerEngine:
                 logger.error(f'Live scan error: {str(e)}')
                 if status_callback:
                     status_callback(self.user_id, error=str(e))
-            socketio.sleep(refresh_interval)
+            if self._wait_with_abort(refresh_interval):
+                break
 
     def scan_once(self, progress_callback=None, reference_time=None):
         """Run a single live scan cycle and persist detected signals."""
-        detected = []
         cycle_time = reference_time or datetime.now()
         self._refresh_daily_caches(cycle_time)
         stocks_all = self._resolve_stock_selection()
@@ -137,90 +167,77 @@ class ScannerEngine:
                 strikes_total=0
             )
         timeframe = self._normalize_timeframe()
-
+        symbol_jobs = []
         for symbol in stocks:
-            if not self.is_running:
-                break
-            self.last_cycle_stocks_scanned += 1
-            if progress_callback:
-                progress_callback(
-                    self.user_id,
-                    stocks_scanned=self.last_cycle_stocks_scanned,
-                    stocks_total=self.last_cycle_stocks_total,
-                    strikes_scanned=self.last_cycle_strikes_scanned,
-                    strikes_total=self.last_cycle_strikes_total
-                )
             expiry = self._resolve_expiry(symbol, reference_date=cycle_time)
             if not expiry:
+                symbol_jobs.append({'symbol': symbol, 'expiry': None, 'strikes_by_type': {'CE': [], 'PE': []}})
                 continue
 
             spot = quotes.get(symbol)
             if not spot:
                 spot = self.angel_api.get_live_quote(symbol, exchange='NSE')
             if not spot or spot.get('ltp') is None:
+                symbol_jobs.append({'symbol': symbol, 'expiry': expiry, 'strikes_by_type': {'CE': [], 'PE': []}})
                 continue
 
             strikes_by_type = self._resolve_strikes_by_type(symbol, expiry, float(spot['ltp']))
-            planned = len(strikes_by_type.get('CE', [])) + len(strikes_by_type.get('PE', []))
-            self.last_cycle_strikes_total += planned
-            if progress_callback:
-                progress_callback(
-                    self.user_id,
-                    stocks_scanned=self.last_cycle_stocks_scanned,
-                    stocks_total=self.last_cycle_stocks_total,
-                    strikes_scanned=self.last_cycle_strikes_scanned,
-                    strikes_total=self.last_cycle_strikes_total
-                )
+            symbol_jobs.append({'symbol': symbol, 'expiry': expiry, 'strikes_by_type': strikes_by_type})
 
-            for option_type in ('CE', 'PE'):
-                for strike in strikes_by_type.get(option_type, []):
-                    self.last_cycle_strikes_scanned += 1
-                    if progress_callback:
-                        progress_callback(
-                            self.user_id,
-                            stocks_scanned=self.last_cycle_stocks_scanned,
-                            stocks_total=self.last_cycle_stocks_total,
-                            strikes_scanned=self.last_cycle_strikes_scanned,
-                            strikes_total=self.last_cycle_strikes_total
-                        )
-                    option_snapshot = self.angel_api.get_recent_option_candle_pair(
-                        underlying=symbol,
-                        expiry=expiry,
-                        strike=strike,
-                        option_type=option_type,
-                        timeframe=timeframe,
-                        exchange='NFO'
+        self.last_cycle_strikes_total = sum(
+            len(job['strikes_by_type'].get('CE', [])) + len(job['strikes_by_type'].get('PE', []))
+            for job in symbol_jobs
+        )
+        if progress_callback:
+            progress_callback(
+                self.user_id,
+                stocks_scanned=self.last_cycle_stocks_scanned,
+                stocks_total=self.last_cycle_stocks_total,
+                strikes_scanned=self.last_cycle_strikes_scanned,
+                strikes_total=self.last_cycle_strikes_total
+            )
+
+        detected = []
+        if not symbol_jobs:
+            return detected
+
+        executor = ThreadPoolExecutor(max_workers=self.max_workers)
+        aborted = False
+        try:
+            future_map = {
+                executor.submit(
+                    self._scan_live_symbol,
+                    job['symbol'],
+                    job['expiry'],
+                    job['strikes_by_type'],
+                    timeframe
+                ): job['symbol']
+                for job in symbol_jobs
+            }
+            for future in as_completed(future_map):
+                self.last_cycle_stocks_scanned += 1
+                symbol_detected = []
+                strikes_scanned = 0
+                try:
+                    symbol_detected, strikes_scanned = future.result()
+                except Exception as e:
+                    logger.error('Live scan worker failed for %s: %s', future_map.get(future), str(e))
+                self.last_cycle_strikes_scanned += self._safe_int(strikes_scanned, 0)
+                if symbol_detected:
+                    detected.extend(symbol_detected)
+                if progress_callback:
+                    progress_callback(
+                        self.user_id,
+                        stocks_scanned=self.last_cycle_stocks_scanned,
+                        stocks_total=self.last_cycle_stocks_total,
+                        strikes_scanned=self.last_cycle_strikes_scanned,
+                        strikes_total=self.last_cycle_strikes_total
                     )
-                    if not option_snapshot:
-                        continue
-
-                    signal_payload = {
-                        'symbol': option_snapshot['symbol'],
-                        'option_type': option_snapshot['option_type'],
-                        'strike_price': option_snapshot['strike_price'],
-                        'ltp': option_snapshot['current_candle_close'],
-                        'previous_candle_close': option_snapshot['previous_candle_close'],
-                        'candle_open': option_snapshot.get('current_candle_open'),
-                        'candle_high': option_snapshot.get('current_candle_high'),
-                        'candle_low': option_snapshot.get('current_candle_low'),
-                        'candle_close': option_snapshot.get('current_candle_close'),
-                        'volume': option_snapshot.get('volume', 0),
-                        'open_interest': option_snapshot.get('open_interest', 0),
-                        'rsi': option_snapshot.get('rsi')
-                    }
-                    signal = SignalDetector.detect_signal(signal_payload, self.config)
-                    if signal:
-                        signal['strike_price'] = self._normalize_signal_strike(
-                            signal.get('strike_price'),
-                            signal.get('symbol')
-                        )
-                        candle_time = option_snapshot.get('candle_time')
-                        if not self._is_new_live_candle_signal(signal['symbol'], candle_time):
-                            continue
-                        signal['expiry_date'] = expiry
-                        signal['detected_at'] = candle_time or datetime.utcnow()
-                        signal['displayed_at'] = datetime.utcnow()
-                        detected.append(signal)
+                if not self.is_running or self._stop_event.is_set():
+                    aborted = True
+                    break
+        finally:
+            executor.shutdown(wait=not aborted, cancel_futures=aborted)
 
         if detected:
             self._persist_signals(detected, mode='live')
@@ -240,6 +257,7 @@ class ScannerEngine:
         """
         logger.info(f'Running backtest from {from_date} to {to_date}')
         self.is_running = True
+        self._stop_event.clear()
 
         detected = []
         stocks = self._resolve_stock_selection()
@@ -247,114 +265,15 @@ class ScannerEngine:
         self.last_backtest_scripts_total = len(stocks)
         self.last_backtest_signals = 0
         timeframe = self._normalize_timeframe()
-
-        for symbol in stocks:
-            if not self.is_running:
-                break
-            # Mark script as scanned when processing starts so progress moves in realtime.
-            self.last_backtest_scripts_scanned += 1
-            socketio.emit(
-                'backtest_progress',
-                {
-                    'mode': 'backtest',
-                    'scripts_scanned': int(self.last_backtest_scripts_scanned),
-                    'scripts_total': int(self.last_backtest_scripts_total),
-                    'signals': int(self.last_backtest_signals),
-                    'running': True,
-                    'updated_at': datetime.utcnow().isoformat() + 'Z'
-                },
-                to=f'user_{self.user_id}'
-            )
-            if progress_callback:
-                progress_callback(
-                    self.user_id,
-                    scripts_scanned=self.last_backtest_scripts_scanned,
-                    signals=self.last_backtest_signals
-                )
-            symbol_detected = []
-            expiry = self._resolve_expiry(symbol, reference_date=from_date)
-            if not expiry:
-                continue
-
-            spot = self.angel_api.get_live_quote(symbol, exchange='NSE')
-            if not spot or spot.get('ltp') is None:
-                continue
-
-            strikes_by_type = self._resolve_strikes_by_type(symbol, expiry, float(spot['ltp']))
-
-            for option_type in ('CE', 'PE'):
-                for strike in strikes_by_type.get(option_type, []):
-                    if not self.is_running:
-                        break
-                    instrument = self.angel_api.lookup_option_instrument(
-                        underlying=symbol,
-                        expiry=expiry,
-                        strike=strike,
-                        option_type=option_type,
-                        exchange='NFO'
-                    )
-                    if not instrument:
-                        continue
-
-                    candles = self.angel_api.get_historical_data(
-                        symbol=instrument['symbol'],
-                        timeframe=timeframe,
-                        from_date=from_date,
-                        to_date=to_date,
-                        exchange='NFO',
-                        symbol_token=instrument['token']
-                    )
-
-                    if not candles or len(candles) < 2:
-                        continue
-
-                    for i in range(1, len(candles)):
-                        if not self.is_running:
-                            break
-                        prev_time = self._parse_candle_time(candles[i - 1][0])
-                        current_time = self._parse_candle_time(candles[i][0])
-                        if not prev_time or not current_time:
-                            continue
-                        previous_close = float(candles[i - 1][4])
-                        current_close = float(candles[i][4])
-                        rsi = self._calculate_rsi(candles[:i + 1], period=14)
-                        option_data = {
-                            'symbol': instrument['symbol'],
-                            'option_type': option_type,
-                            'strike_price': strike,
-                            'ltp': current_close,
-                            'previous_candle_close': previous_close,
-                            'candle_open': float(candles[i][1]) if len(candles[i]) > 1 else None,
-                            'candle_high': float(candles[i][2]) if len(candles[i]) > 2 else None,
-                            'candle_low': float(candles[i][3]) if len(candles[i]) > 3 else None,
-                            'candle_close': current_close,
-                            'volume': int(float(candles[i][5])) if len(candles[i]) > 5 else 0,
-                            'open_interest': 0,
-                            'rsi': rsi
-                        }
-
-                        signal = SignalDetector.detect_signal(option_data, self.config)
-                        if signal:
-                            signal['strike_price'] = self._normalize_signal_strike(
-                                signal.get('strike_price'),
-                                signal.get('symbol')
-                            )
-                            signal['expiry_date'] = expiry
-                            signal['detected_at'] = current_time
-                            signal['displayed_at'] = datetime.utcnow()
-                            signal['mode'] = 'backtest'
-                            symbol_detected.append(signal)
-                            detected.append(signal)
-                            # Stream signal row immediately for realtime backtest table updates.
-                            socketio.emit(
-                                'new_signal',
-                                self._serialize_realtime_signal(signal),
-                                to=f'user_{self.user_id}'
-                            )
-
-            if symbol_detected:
-                self._persist_signals(symbol_detected, mode='backtest')
-                self.last_backtest_signals += len(symbol_detected)
+        executor = ThreadPoolExecutor(max_workers=self.max_workers)
+        aborted = False
+        try:
+            future_map = {
+                executor.submit(self._run_backtest_symbol, symbol, from_date, to_date, timeframe): symbol
+                for symbol in stocks
+            }
+            for future in as_completed(future_map):
+                self.last_backtest_scripts_scanned += 1
                 socketio.emit(
                     'backtest_progress',
                     {
@@ -367,6 +286,24 @@ class ScannerEngine:
                     },
                     to=f'user_{self.user_id}'
                 )
+
+                symbol_detected = []
+                try:
+                    symbol_detected = future.result() or []
+                except Exception as e:
+                    logger.error('Backtest worker failed for %s: %s', future_map.get(future), str(e))
+
+                if symbol_detected:
+                    self._persist_signals(symbol_detected, mode='backtest')
+                    self.last_backtest_signals += len(symbol_detected)
+                    detected.extend(symbol_detected)
+                    for signal in symbol_detected:
+                        socketio.emit(
+                            'new_signal',
+                            self._serialize_realtime_signal(signal),
+                            to=f'user_{self.user_id}'
+                        )
+
                 if progress_callback:
                     progress_callback(
                         self.user_id,
@@ -374,11 +311,148 @@ class ScannerEngine:
                         signals=self.last_backtest_signals
                     )
 
+                if not self.is_running or self._stop_event.is_set():
+                    aborted = True
+                    break
+        finally:
+            executor.shutdown(wait=not aborted, cancel_futures=aborted)
+
         # Keep explicit final counters available in status.
         self.last_backtest_signals = int(self.last_backtest_signals or 0)
         self.is_running = False
 
         return detected
+
+    def _scan_live_symbol(self, symbol, expiry, strikes_by_type, timeframe):
+        if not self.is_running or self._stop_event.is_set() or not expiry:
+            return [], 0
+
+        strikes_processed = 0
+        symbol_detected = []
+        for option_type in ('CE', 'PE'):
+            for strike in strikes_by_type.get(option_type, []):
+                if not self.is_running or self._stop_event.is_set():
+                    return symbol_detected, strikes_processed
+                strikes_processed += 1
+                option_snapshot = self.angel_api.get_recent_option_candle_pair(
+                    underlying=symbol,
+                    expiry=expiry,
+                    strike=strike,
+                    option_type=option_type,
+                    timeframe=timeframe,
+                    exchange='NFO'
+                )
+                if not option_snapshot:
+                    continue
+
+                signal_payload = {
+                    'symbol': option_snapshot['symbol'],
+                    'option_type': option_snapshot['option_type'],
+                    'strike_price': option_snapshot['strike_price'],
+                    'ltp': option_snapshot['current_candle_close'],
+                    'previous_candle_close': option_snapshot['previous_candle_close'],
+                    'candle_open': option_snapshot.get('current_candle_open'),
+                    'candle_high': option_snapshot.get('current_candle_high'),
+                    'candle_low': option_snapshot.get('current_candle_low'),
+                    'candle_close': option_snapshot.get('current_candle_close'),
+                    'volume': option_snapshot.get('volume', 0),
+                    'open_interest': option_snapshot.get('open_interest', 0),
+                    'rsi': option_snapshot.get('rsi')
+                }
+                signal = SignalDetector.detect_signal(signal_payload, self.config)
+                if not signal:
+                    continue
+                signal['strike_price'] = self._normalize_signal_strike(
+                    signal.get('strike_price'),
+                    signal.get('symbol')
+                )
+                candle_time = option_snapshot.get('candle_time')
+                if not self._is_new_live_candle_signal(signal['symbol'], candle_time):
+                    continue
+                signal['expiry_date'] = expiry
+                signal['detected_at'] = candle_time or datetime.utcnow()
+                signal['displayed_at'] = datetime.utcnow()
+                symbol_detected.append(signal)
+        return symbol_detected, strikes_processed
+
+    def _run_backtest_symbol(self, symbol, from_date, to_date, timeframe):
+        if not self.is_running or self._stop_event.is_set():
+            return []
+
+        symbol_detected = []
+        expiry = self._resolve_expiry(symbol, reference_date=from_date)
+        if not expiry:
+            return symbol_detected
+
+        spot = self.angel_api.get_live_quote(symbol, exchange='NSE')
+        if not spot or spot.get('ltp') is None:
+            return symbol_detected
+
+        strikes_by_type = self._resolve_strikes_by_type(symbol, expiry, float(spot['ltp']))
+        for option_type in ('CE', 'PE'):
+            for strike in strikes_by_type.get(option_type, []):
+                if not self.is_running or self._stop_event.is_set():
+                    return symbol_detected
+
+                instrument = self.angel_api.lookup_option_instrument(
+                    underlying=symbol,
+                    expiry=expiry,
+                    strike=strike,
+                    option_type=option_type,
+                    exchange='NFO'
+                )
+                if not instrument:
+                    continue
+
+                candles = self.angel_api.get_historical_data(
+                    symbol=instrument['symbol'],
+                    timeframe=timeframe,
+                    from_date=from_date,
+                    to_date=to_date,
+                    exchange='NFO',
+                    symbol_token=instrument['token']
+                )
+                if not candles or len(candles) < 2:
+                    continue
+
+                for i in range(1, len(candles)):
+                    if not self.is_running or self._stop_event.is_set():
+                        return symbol_detected
+                    prev_time = self._parse_candle_time(candles[i - 1][0])
+                    current_time = self._parse_candle_time(candles[i][0])
+                    if not prev_time or not current_time:
+                        continue
+                    previous_close = float(candles[i - 1][4])
+                    current_close = float(candles[i][4])
+                    rsi = self._calculate_rsi(candles[:i + 1], period=14)
+                    option_data = {
+                        'symbol': instrument['symbol'],
+                        'option_type': option_type,
+                        'strike_price': strike,
+                        'ltp': current_close,
+                        'previous_candle_close': previous_close,
+                        'candle_open': float(candles[i][1]) if len(candles[i]) > 1 else None,
+                        'candle_high': float(candles[i][2]) if len(candles[i]) > 2 else None,
+                        'candle_low': float(candles[i][3]) if len(candles[i]) > 3 else None,
+                        'candle_close': current_close,
+                        'volume': int(float(candles[i][5])) if len(candles[i]) > 5 else 0,
+                        'open_interest': 0,
+                        'rsi': rsi
+                    }
+                    signal = SignalDetector.detect_signal(option_data, self.config)
+                    if not signal:
+                        continue
+                    signal['strike_price'] = self._normalize_signal_strike(
+                        signal.get('strike_price'),
+                        signal.get('symbol')
+                    )
+                    signal['expiry_date'] = expiry
+                    signal['detected_at'] = current_time
+                    signal['displayed_at'] = datetime.utcnow()
+                    signal['mode'] = 'backtest'
+                    symbol_detected.append(signal)
+
+        return symbol_detected
 
     def get_selected_expiries(self, reference_date=None):
         """Return selected expiry per symbol for current config."""
@@ -572,11 +646,12 @@ class ScannerEngine:
             return True
         key = symbol
         stamp = candle_time.isoformat()
-        last = self._last_live_signal_candle.get(key)
-        if last == stamp:
-            return False
-        self._last_live_signal_candle[key] = stamp
-        return True
+        with self._live_signal_lock:
+            last = self._last_live_signal_candle.get(key)
+            if last == stamp:
+                return False
+            self._last_live_signal_candle[key] = stamp
+            return True
 
     def _calculate_rsi(self, candles, period=14):
         """
@@ -675,6 +750,12 @@ class ScannerEngine:
             return int(value)
         except Exception:
             return default
+
+    def _wait_with_abort(self, seconds):
+        timeout = max(0, self._safe_int(seconds, 0))
+        if timeout <= 0:
+            return self._stop_event.is_set() or (not self.is_running)
+        return self._stop_event.wait(timeout=timeout)
 
     def _effective_strike_range(self):
         configured = self._safe_int(getattr(self.config, 'strike_range', 0), 0)

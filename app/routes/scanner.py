@@ -24,6 +24,8 @@ logger = logging.getLogger(__name__)
 
 ALLOWED_TIMEFRAMES = {1, 3, 5, 15, 30, 60}
 LIVE_TRACE_FILE = os.path.join('logs', 'live_trace.log')
+DEFAULT_SCAN_WORKERS = 8
+VALID_SCAN_PROFILES = {'conservative', 'balanced', 'aggressive'}
 
 
 def _trace_live(message):
@@ -44,7 +46,63 @@ def _default_config_payload():
         'strikeRange': 2,
         'priceMultiplier': 2.0,
         'timeframe': 5,
-        'refreshInterval': 5
+        'refreshInterval': 5,
+        'workers': DEFAULT_SCAN_WORKERS,
+        'autoTune': True,
+        'scanProfile': 'balanced',
+        'livePrefilterEnabled': True,
+        'livePrefilterTopMovers': 30,
+        'livePrefilterTopVolume': 30,
+        'livePrefilterMaxStocks': 50,
+        'liveWorkersCap': DEFAULT_SCAN_WORKERS,
+        'backtestWorkersCap': DEFAULT_SCAN_WORKERS,
+        'guardrailEnabled': True,
+        'guardrailLoadThreshold': 1200
+    }
+
+
+def _coerce_bool(value, default=False):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def _safe_int(value, default=0):
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _clamp_int(value, minimum, maximum, default):
+    num = _safe_int(value, default)
+    return max(minimum, min(maximum, num))
+
+
+def _normalize_profile(value, default='balanced'):
+    token = str(value or default).strip().lower()
+    return token if token in VALID_SCAN_PROFILES else default
+
+
+def _user_runtime_defaults():
+    default_cfg = _default_config_payload()
+    scan_workers = max(1, min(16, int(getattr(current_user, 'scan_workers', DEFAULT_SCAN_WORKERS) or DEFAULT_SCAN_WORKERS)))
+    live_cap = max(1, min(16, int(getattr(current_user, 'live_workers_cap', scan_workers) or scan_workers)))
+    backtest_cap = max(1, min(16, int(getattr(current_user, 'backtest_workers_cap', scan_workers) or scan_workers)))
+    return {
+        'workers': scan_workers,
+        'autoTune': bool(getattr(current_user, 'auto_tune_default', True)),
+        'scanProfile': _normalize_profile(getattr(current_user, 'scan_profile', default_cfg['scanProfile'])),
+        'livePrefilterEnabled': bool(getattr(current_user, 'live_prefilter_default', True)),
+        'livePrefilterTopMovers': _clamp_int(getattr(current_user, 'live_prefilter_top_movers', 30), 0, 500, 30),
+        'livePrefilterTopVolume': _clamp_int(getattr(current_user, 'live_prefilter_top_volume', 30), 0, 500, 30),
+        'livePrefilterMaxStocks': _clamp_int(getattr(current_user, 'live_prefilter_max_stocks', 50), 1, 500, 50),
+        'liveWorkersCap': live_cap,
+        'backtestWorkersCap': backtest_cap,
+        'guardrailEnabled': bool(getattr(current_user, 'guardrail_enabled', True)),
+        'guardrailLoadThreshold': _clamp_int(getattr(current_user, 'guardrail_load_threshold', 1200), 100, 25000, 1200)
     }
 
 
@@ -84,6 +142,53 @@ def _normalize_config_payload(data):
         payload['refreshInterval'] = max(1, min(60, int(data.get('refreshInterval', payload['refreshInterval']))))
     except Exception:
         pass
+    auto_tune_raw = data.get('autoTune', payload.get('autoTune', True))
+    payload['autoTune'] = str(auto_tune_raw).strip().lower() in ('1', 'true', 'yes', 'on')
+    payload['scanProfile'] = _normalize_profile(data.get('scanProfile', payload.get('scanProfile', 'balanced')))
+    payload['livePrefilterEnabled'] = _coerce_bool(
+        data.get('livePrefilterEnabled', payload.get('livePrefilterEnabled', True)),
+        default=True
+    )
+    payload['livePrefilterTopMovers'] = _clamp_int(
+        data.get('livePrefilterTopMovers', payload.get('livePrefilterTopMovers', 30)),
+        0,
+        500,
+        30
+    )
+    payload['livePrefilterTopVolume'] = _clamp_int(
+        data.get('livePrefilterTopVolume', payload.get('livePrefilterTopVolume', 30)),
+        0,
+        500,
+        30
+    )
+    payload['livePrefilterMaxStocks'] = _clamp_int(
+        data.get('livePrefilterMaxStocks', payload.get('livePrefilterMaxStocks', 50)),
+        1,
+        500,
+        50
+    )
+    payload['liveWorkersCap'] = _clamp_int(
+        data.get('liveWorkersCap', payload.get('liveWorkersCap', DEFAULT_SCAN_WORKERS)),
+        1,
+        16,
+        DEFAULT_SCAN_WORKERS
+    )
+    payload['backtestWorkersCap'] = _clamp_int(
+        data.get('backtestWorkersCap', payload.get('backtestWorkersCap', DEFAULT_SCAN_WORKERS)),
+        1,
+        16,
+        DEFAULT_SCAN_WORKERS
+    )
+    payload['guardrailEnabled'] = _coerce_bool(
+        data.get('guardrailEnabled', payload.get('guardrailEnabled', True)),
+        default=True
+    )
+    payload['guardrailLoadThreshold'] = _clamp_int(
+        data.get('guardrailLoadThreshold', payload.get('guardrailLoadThreshold', 1200)),
+        100,
+        25000,
+        1200
+    )
     return payload
 
 
@@ -97,7 +202,8 @@ def _get_user_default_config(user_id):
         'strikeRange': int(cfg.strike_range or 5),
         'priceMultiplier': float(cfg.price_multiplier or 2.0),
         'timeframe': int(str(cfg.timeframe or '5').replace('min', '')),
-        'refreshInterval': max(1, int((cfg.refresh_interval or 300) / 60))
+        'refreshInterval': max(1, int((cfg.refresh_interval or 300) / 60)),
+        **_user_runtime_defaults()
     }
 
 
@@ -113,9 +219,11 @@ def configuration():
 def get_scanner_config():
     """Get saved default scanner config for current user."""
     cfg = _get_user_default_config(current_user.id)
+    default_cfg = _default_config_payload()
+    default_cfg.update(_user_runtime_defaults())
     return jsonify({
         'success': True,
-        'config': cfg or _default_config_payload()
+        'config': cfg or default_cfg
     })
 
 
@@ -172,12 +280,78 @@ def save_scanner_config():
     cfg.timeframe = f"{payload['timeframe']}min"
     cfg.refresh_interval = payload['refreshInterval'] * 60
 
+    # Persist runtime defaults on user profile as well.
+    current_user.scan_workers = _clamp_int(payload.get('workers', DEFAULT_SCAN_WORKERS), 1, 16, DEFAULT_SCAN_WORKERS)
+    current_user.live_workers_cap = _clamp_int(payload.get('liveWorkersCap', current_user.scan_workers), 1, 16, current_user.scan_workers)
+    current_user.backtest_workers_cap = _clamp_int(payload.get('backtestWorkersCap', current_user.scan_workers), 1, 16, current_user.scan_workers)
+    current_user.scan_profile = _normalize_profile(payload.get('scanProfile', 'balanced'))
+    current_user.auto_tune_default = _coerce_bool(payload.get('autoTune'), default=True)
+    current_user.live_prefilter_default = _coerce_bool(payload.get('livePrefilterEnabled'), default=True)
+    current_user.live_prefilter_top_movers = _clamp_int(payload.get('livePrefilterTopMovers', 30), 0, 500, 30)
+    current_user.live_prefilter_top_volume = _clamp_int(payload.get('livePrefilterTopVolume', 30), 0, 500, 30)
+    current_user.live_prefilter_max_stocks = _clamp_int(payload.get('livePrefilterMaxStocks', 50), 1, 500, 50)
+    current_user.guardrail_enabled = _coerce_bool(payload.get('guardrailEnabled'), default=True)
+    current_user.guardrail_load_threshold = _clamp_int(payload.get('guardrailLoadThreshold', 1200), 100, 25000, 1200)
+
     db.session.commit()
     return jsonify({
         'success': True,
         'message': 'Scanner configuration saved.',
         'config': payload
     })
+
+
+@scanner_bp.route('/api/config/export', methods=['GET'])
+@login_required
+def export_scanner_config():
+    cfg = _get_user_default_config(current_user.id) or _default_config_payload()
+    payload = {
+        'version': 1,
+        'exported_at': datetime.utcnow().isoformat() + 'Z',
+        'config': cfg
+    }
+    return jsonify({'success': True, 'payload': payload})
+
+
+@scanner_bp.route('/api/config/import', methods=['POST'])
+@login_required
+def import_scanner_config():
+    incoming = request.get_json(silent=True) or {}
+    raw = incoming.get('payload') if isinstance(incoming.get('payload'), dict) else incoming
+    if not isinstance(raw, dict):
+        return jsonify({'success': False, 'error': 'Invalid import payload.'}), 400
+    cfg_payload = raw.get('config') if isinstance(raw.get('config'), dict) else raw
+    payload = _normalize_config_payload(cfg_payload)
+
+    cfg = ScannerConfig.query.filter_by(user_id=current_user.id, is_default=True).first()
+    if not cfg:
+        cfg = ScannerConfig(
+            user_id=current_user.id,
+            config_name='Default Scanner Config',
+            is_default=True
+        )
+        db.session.add(cfg)
+
+    cfg.stock_selection = payload['stockSelection']
+    cfg.strike_range = payload['strikeRange']
+    cfg.price_multiplier = payload['priceMultiplier']
+    cfg.timeframe = f"{payload['timeframe']}min"
+    cfg.refresh_interval = payload['refreshInterval'] * 60
+
+    current_user.scan_workers = _clamp_int(payload.get('workers', DEFAULT_SCAN_WORKERS), 1, 16, DEFAULT_SCAN_WORKERS)
+    current_user.live_workers_cap = _clamp_int(payload.get('liveWorkersCap', current_user.scan_workers), 1, 16, current_user.scan_workers)
+    current_user.backtest_workers_cap = _clamp_int(payload.get('backtestWorkersCap', current_user.scan_workers), 1, 16, current_user.scan_workers)
+    current_user.scan_profile = _normalize_profile(payload.get('scanProfile', 'balanced'))
+    current_user.auto_tune_default = _coerce_bool(payload.get('autoTune'), default=True)
+    current_user.live_prefilter_default = _coerce_bool(payload.get('livePrefilterEnabled'), default=True)
+    current_user.live_prefilter_top_movers = _clamp_int(payload.get('livePrefilterTopMovers', 30), 0, 500, 30)
+    current_user.live_prefilter_top_volume = _clamp_int(payload.get('livePrefilterTopVolume', 30), 0, 500, 30)
+    current_user.live_prefilter_max_stocks = _clamp_int(payload.get('livePrefilterMaxStocks', 50), 1, 500, 50)
+    current_user.guardrail_enabled = _coerce_bool(payload.get('guardrailEnabled'), default=True)
+    current_user.guardrail_load_threshold = _clamp_int(payload.get('guardrailLoadThreshold', 1200), 100, 25000, 1200)
+
+    db.session.commit()
+    return jsonify({'success': True, 'message': 'Configuration imported successfully.', 'config': payload})
 
 
 @scanner_bp.route('/api/start-live', methods=['POST'])
