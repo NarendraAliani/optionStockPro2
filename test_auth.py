@@ -5,15 +5,37 @@ import requests
 from bs4 import BeautifulSoup
 import re
 from datetime import datetime
+import os
+import sys
+import time
 
-BASE_URL = "http://localhost:5000"
+BASE_URL = os.getenv("BASE_URL", "http://localhost:5000")
 
 # Create a session to maintain cookies
 session = requests.Session()
 
+
+def wait_for_server(base_url, timeout_seconds=20):
+    """Wait for the Flask server to be reachable before running tests."""
+    deadline = time.time() + timeout_seconds
+    url = f"{base_url}/auth/login"
+    while time.time() < deadline:
+        try:
+            response = session.get(url, timeout=3)
+            if response.status_code == 200:
+                return True
+        except requests.RequestException:
+            time.sleep(1)
+    return False
+
 print("=" * 60)
 print("TESTING OPTIONS SIGNAL SCANNER PRO")
 print("=" * 60)
+
+if not wait_for_server(BASE_URL):
+    print("\nERROR: App server is not reachable.")
+    print(f"Start the app first, then retry: python run.py  (URL: {BASE_URL})")
+    sys.exit(1)
 
 # Test 1: Get registration page
 print("\n[TEST 1] Getting registration page...")

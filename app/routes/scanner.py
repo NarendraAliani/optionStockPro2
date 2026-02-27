@@ -1,7 +1,7 @@
 """
 Scanner Routes
 """
-from flask import Blueprint, render_template, jsonify, request
+from flask import Blueprint, render_template, jsonify, request, send_file
 from flask_login import login_required, current_user
 from app import db, csrf
 from app.models.scanner_config import ScannerConfig
@@ -18,6 +18,7 @@ from flask import current_app
 import logging
 import os
 from datetime import datetime
+from pathlib import Path
 
 scanner_bp = Blueprint('scanner', __name__)
 logger = logging.getLogger(__name__)
@@ -26,6 +27,7 @@ ALLOWED_TIMEFRAMES = {1, 3, 5, 15, 30, 60}
 LIVE_TRACE_FILE = os.path.join('logs', 'live_trace.log')
 DEFAULT_SCAN_WORKERS = 8
 VALID_SCAN_PROFILES = {'conservative', 'balanced', 'aggressive'}
+VALID_REBALANCE_FREQUENCIES = {'daily', 'weekly', 'monthly'}
 
 
 def _trace_live(message):
@@ -43,10 +45,10 @@ def _trace_live(message):
 def _default_config_payload():
     return {
         'stockSelection': 'all',
-        'strikeRange': 2,
+        'strikeRange': 0,
         'priceMultiplier': 2.0,
-        'timeframe': 5,
-        'refreshInterval': 5,
+        'timeframe': 15,
+        'refreshInterval': 15,
         'workers': DEFAULT_SCAN_WORKERS,
         'autoTune': True,
         'scanProfile': 'balanced',
@@ -56,8 +58,14 @@ def _default_config_payload():
         'livePrefilterMaxStocks': 50,
         'liveWorkersCap': DEFAULT_SCAN_WORKERS,
         'backtestWorkersCap': DEFAULT_SCAN_WORKERS,
+        'backtestRebalanceFrequency': 'weekly',
+        'backtestStrictFirstCandle': True,
+        'backtestLiquidityFilterEnabled': True,
+        'backtestMinCandlesPerStrike': 5,
+        'backtestMinAvgVolume': 1,
         'guardrailEnabled': True,
-        'guardrailLoadThreshold': 1200
+        'guardrailLoadThreshold': 1200,
+        'notificationServicesEnabled': True
     }
 
 
@@ -86,6 +94,11 @@ def _normalize_profile(value, default='balanced'):
     return token if token in VALID_SCAN_PROFILES else default
 
 
+def _normalize_rebalance_frequency(value, default='weekly'):
+    token = str(value or default).strip().lower()
+    return token if token in VALID_REBALANCE_FREQUENCIES else default
+
+
 def _user_runtime_defaults():
     default_cfg = _default_config_payload()
     scan_workers = max(1, min(16, int(getattr(current_user, 'scan_workers', DEFAULT_SCAN_WORKERS) or DEFAULT_SCAN_WORKERS)))
@@ -101,8 +114,16 @@ def _user_runtime_defaults():
         'livePrefilterMaxStocks': _clamp_int(getattr(current_user, 'live_prefilter_max_stocks', 50), 1, 500, 50),
         'liveWorkersCap': live_cap,
         'backtestWorkersCap': backtest_cap,
+        'backtestRebalanceFrequency': _normalize_rebalance_frequency(
+            getattr(current_user, 'backtest_rebalance_frequency', 'weekly')
+        ),
+        'backtestStrictFirstCandle': bool(getattr(current_user, 'backtest_strict_first_candle', True)),
+        'backtestLiquidityFilterEnabled': bool(getattr(current_user, 'backtest_liquidity_filter_enabled', True)),
+        'backtestMinCandlesPerStrike': _clamp_int(getattr(current_user, 'backtest_min_candles_per_strike', 5), 2, 500, 5),
+        'backtestMinAvgVolume': _clamp_int(getattr(current_user, 'backtest_min_avg_volume', 1), 0, 1_000_000, 1),
         'guardrailEnabled': bool(getattr(current_user, 'guardrail_enabled', True)),
-        'guardrailLoadThreshold': _clamp_int(getattr(current_user, 'guardrail_load_threshold', 1200), 100, 25000, 1200)
+        'guardrailLoadThreshold': _clamp_int(getattr(current_user, 'guardrail_load_threshold', 1200), 100, 25000, 1200),
+        'notificationServicesEnabled': bool(getattr(current_user, 'notification_services_enabled', True))
     }
 
 
@@ -126,7 +147,8 @@ def _normalize_config_payload(data):
         elif stock_selection:
             payload['stockSelection'] = stock_selection.upper()
     try:
-        payload['strikeRange'] = max(1, min(20, int(data.get('strikeRange', payload['strikeRange']))))
+        # 0 means scan all available strikes; 1..50 keeps bounded custom ranges.
+        payload['strikeRange'] = max(0, min(50, int(data.get('strikeRange', payload['strikeRange']))))
     except Exception:
         pass
     try:
@@ -135,7 +157,7 @@ def _normalize_config_payload(data):
         pass
     try:
         timeframe = int(data.get('timeframe', payload['timeframe']))
-        payload['timeframe'] = timeframe if timeframe in ALLOWED_TIMEFRAMES else 5
+        payload['timeframe'] = timeframe if timeframe in ALLOWED_TIMEFRAMES else 15
     except Exception:
         pass
     try:
@@ -179,6 +201,29 @@ def _normalize_config_payload(data):
         16,
         DEFAULT_SCAN_WORKERS
     )
+    payload['backtestRebalanceFrequency'] = _normalize_rebalance_frequency(
+        data.get('backtestRebalanceFrequency', payload.get('backtestRebalanceFrequency', 'weekly'))
+    )
+    payload['backtestStrictFirstCandle'] = _coerce_bool(
+        data.get('backtestStrictFirstCandle', payload.get('backtestStrictFirstCandle', True)),
+        default=True
+    )
+    payload['backtestLiquidityFilterEnabled'] = _coerce_bool(
+        data.get('backtestLiquidityFilterEnabled', payload.get('backtestLiquidityFilterEnabled', True)),
+        default=True
+    )
+    payload['backtestMinCandlesPerStrike'] = _clamp_int(
+        data.get('backtestMinCandlesPerStrike', payload.get('backtestMinCandlesPerStrike', 5)),
+        2,
+        500,
+        5
+    )
+    payload['backtestMinAvgVolume'] = _clamp_int(
+        data.get('backtestMinAvgVolume', payload.get('backtestMinAvgVolume', 1)),
+        0,
+        1_000_000,
+        1
+    )
     payload['guardrailEnabled'] = _coerce_bool(
         data.get('guardrailEnabled', payload.get('guardrailEnabled', True)),
         default=True
@@ -188,6 +233,10 @@ def _normalize_config_payload(data):
         100,
         25000,
         1200
+    )
+    payload['notificationServicesEnabled'] = _coerce_bool(
+        data.get('notificationServicesEnabled', payload.get('notificationServicesEnabled', True)),
+        default=True
     )
     return payload
 
@@ -199,7 +248,7 @@ def _get_user_default_config(user_id):
     stock_selection = cfg.get_stock_selection()
     return {
         'stockSelection': stock_selection if stock_selection else 'all',
-        'strikeRange': int(cfg.strike_range or 5),
+        'strikeRange': int(cfg.strike_range) if cfg.strike_range is not None else 0,
         'priceMultiplier': float(cfg.price_multiplier or 2.0),
         'timeframe': int(str(cfg.timeframe or '5').replace('min', '')),
         'refreshInterval': max(1, int((cfg.refresh_interval or 300) / 60)),
@@ -290,10 +339,21 @@ def save_scanner_config():
     current_user.live_prefilter_top_movers = _clamp_int(payload.get('livePrefilterTopMovers', 30), 0, 500, 30)
     current_user.live_prefilter_top_volume = _clamp_int(payload.get('livePrefilterTopVolume', 30), 0, 500, 30)
     current_user.live_prefilter_max_stocks = _clamp_int(payload.get('livePrefilterMaxStocks', 50), 1, 500, 50)
+    current_user.backtest_rebalance_frequency = _normalize_rebalance_frequency(payload.get('backtestRebalanceFrequency', 'weekly'))
+    current_user.backtest_strict_first_candle = _coerce_bool(payload.get('backtestStrictFirstCandle'), default=True)
+    current_user.backtest_liquidity_filter_enabled = _coerce_bool(payload.get('backtestLiquidityFilterEnabled'), default=True)
+    current_user.backtest_min_candles_per_strike = _clamp_int(payload.get('backtestMinCandlesPerStrike', 5), 2, 500, 5)
+    current_user.backtest_min_avg_volume = _clamp_int(payload.get('backtestMinAvgVolume', 1), 0, 1_000_000, 1)
     current_user.guardrail_enabled = _coerce_bool(payload.get('guardrailEnabled'), default=True)
     current_user.guardrail_load_threshold = _clamp_int(payload.get('guardrailLoadThreshold', 1200), 100, 25000, 1200)
+    current_user.notification_services_enabled = _coerce_bool(payload.get('notificationServicesEnabled'), default=True)
 
     db.session.commit()
+    try:
+        from app.services.telegram_notifier import invalidate_notification_pref_cache
+        invalidate_notification_pref_cache(current_user.id)
+    except Exception:
+        pass
     return jsonify({
         'success': True,
         'message': 'Scanner configuration saved.',
@@ -347,10 +407,21 @@ def import_scanner_config():
     current_user.live_prefilter_top_movers = _clamp_int(payload.get('livePrefilterTopMovers', 30), 0, 500, 30)
     current_user.live_prefilter_top_volume = _clamp_int(payload.get('livePrefilterTopVolume', 30), 0, 500, 30)
     current_user.live_prefilter_max_stocks = _clamp_int(payload.get('livePrefilterMaxStocks', 50), 1, 500, 50)
+    current_user.backtest_rebalance_frequency = _normalize_rebalance_frequency(payload.get('backtestRebalanceFrequency', 'weekly'))
+    current_user.backtest_strict_first_candle = _coerce_bool(payload.get('backtestStrictFirstCandle'), default=True)
+    current_user.backtest_liquidity_filter_enabled = _coerce_bool(payload.get('backtestLiquidityFilterEnabled'), default=True)
+    current_user.backtest_min_candles_per_strike = _clamp_int(payload.get('backtestMinCandlesPerStrike', 5), 2, 500, 5)
+    current_user.backtest_min_avg_volume = _clamp_int(payload.get('backtestMinAvgVolume', 1), 0, 1_000_000, 1)
     current_user.guardrail_enabled = _coerce_bool(payload.get('guardrailEnabled'), default=True)
     current_user.guardrail_load_threshold = _clamp_int(payload.get('guardrailLoadThreshold', 1200), 100, 25000, 1200)
+    current_user.notification_services_enabled = _coerce_bool(payload.get('notificationServicesEnabled'), default=True)
 
     db.session.commit()
+    try:
+        from app.services.telegram_notifier import invalidate_notification_pref_cache
+        invalidate_notification_pref_cache(current_user.id)
+    except Exception:
+        pass
     return jsonify({'success': True, 'message': 'Configuration imported successfully.', 'config': payload})
 
 
@@ -513,6 +584,262 @@ def stop_backtest():
             'success': False,
             'error': f'Failed to stop backtest: {str(e)}'
         }), 500
+
+
+@scanner_bp.route('/api/test-telegram', methods=['POST'])
+@login_required
+def test_telegram():
+    payload = request.get_json(silent=True) or {}
+    text = (payload.get('text') or '').strip()
+    if not text:
+        stamp = datetime.utcnow().isoformat() + 'Z'
+        text = f'Telegram test message @ {stamp}'
+    try:
+        from app.services.telegram_notifier import send_test_notification, get_telegram_notifier
+        notifier = get_telegram_notifier()
+        ok, reason, detail = send_test_notification(text, user_id=current_user.id)
+        status = 200 if ok else 400
+        token = notifier.bot_token or ''
+        diag = {
+            'enabled': bool(getattr(notifier, 'enabled', False)),
+            'active': bool(notifier.is_active()),
+            'live_only': bool(getattr(notifier, 'live_only', False)),
+            'channel_id': notifier.channel_id or None,
+            'token_suffix': token[-4:] if len(token) >= 4 else None,
+            'notification_services_enabled': bool(getattr(current_user, 'notification_services_enabled', True))
+        }
+        return jsonify({
+            'success': bool(ok),
+            'reason': reason,
+            'detail': detail,
+            'diag': diag
+        }), status
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'reason': f'exception:{str(e)}',
+            'detail': None
+        }), 500
+
+
+@scanner_bp.route('/api/test-telegram-signal', methods=['POST'])
+@login_required
+def test_telegram_signal():
+    payload = request.get_json(silent=True) or {}
+    symbol = (payload.get('symbol') or 'RELIANCE').strip().upper()
+    option_type = (payload.get('option_type') or 'CE').strip().upper()
+    timeframe = int(payload.get('timeframe') or 15)
+    sample = {
+        'symbol': symbol,
+        'strike_price': float(payload.get('strike_price') or 2850),
+        'option_type': option_type if option_type in ('CE', 'PE') else 'CE',
+        'timeframe': timeframe,
+        'entry_price': float(payload.get('entry_price') or 12.45),
+        'current_price': float(payload.get('current_price') or 14.2),
+        'price_change_percent': float(payload.get('price_change_percent') or 14.06),
+        'volume': int(payload.get('volume') or 182340),
+        'rsi': float(payload.get('rsi') or 63.8),
+        'expiry_date': payload.get('expiry_date') or (datetime.utcnow().date().isoformat()),
+        'detected_at': datetime.utcnow().isoformat() + 'Z'
+    }
+    try:
+        from app.services.telegram_notifier import get_telegram_notifier
+        notifier = get_telegram_notifier()
+        ok, reason = notifier.notify_signal(sample, mode='live', user_id=current_user.id)
+        token = notifier.bot_token or ''
+        diag = {
+            'active': bool(notifier.is_active()),
+            'live_only': bool(getattr(notifier, 'live_only', False)),
+            'channel_id': notifier.channel_id or None,
+            'token_suffix': token[-4:] if len(token) >= 4 else None,
+            'notification_services_enabled': bool(getattr(current_user, 'notification_services_enabled', True))
+        }
+        status = 200 if ok else 400
+        return jsonify({
+            'success': bool(ok),
+            'reason': reason,
+            'detail': notifier.get_last_send_detail(),
+            'sample': sample,
+            'diag': diag
+        }), status
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'reason': f'exception:{str(e)}'
+        }), 500
+
+
+@scanner_bp.route('/api/strike-preview', methods=['POST'])
+@login_required
+def strike_preview():
+    payload = request.get_json(silent=True) or {}
+    symbol = str(payload.get('symbol') or '').strip().upper()
+    if not symbol:
+        return jsonify({'success': False, 'error': 'Symbol is required.'}), 400
+    try:
+        cmp_value = float(payload.get('cmp'))
+    except Exception:
+        return jsonify({'success': False, 'error': 'CMP (spot price) is required.'}), 400
+
+    try:
+        strike_range = int(payload.get('strikeRange', 0))
+    except Exception:
+        strike_range = 0
+    strike_range = max(0, min(50, strike_range))
+
+    try:
+        max_preview = int(payload.get('maxPreview', 20))
+    except Exception:
+        max_preview = 20
+    max_preview = max(0, min(200, max_preview))
+
+    class _DummyConfig:
+        def __init__(self, strike_range_value):
+            self.id = None
+            self.strike_range = strike_range_value
+            self.timeframe = '15min'
+            self.refresh_interval = 900
+
+    try:
+        api = AngelOneAPI(api_key='', client_id='', password='')
+        if not api.load_scrip_master():
+            return jsonify({'success': False, 'error': 'Scrip master not available.'}), 500
+        engine = ScannerEngine(
+            user_id=current_user.id,
+            config=_DummyConfig(strike_range),
+            angel_api=api,
+            workers=1
+        )
+        expiry = engine._resolve_expiry(symbol, reference_date=datetime.utcnow())
+        if not expiry:
+            return jsonify({'success': False, 'error': 'Unable to resolve expiry for symbol.'}), 400
+        strikes_by_type = engine._resolve_strikes_by_type(symbol, expiry, cmp_value)
+
+        def _preview(strikes):
+            if max_preview <= 0:
+                return sorted(strikes)
+            ordered = sorted(strikes, key=lambda s: (abs(float(s) - cmp_value), float(s)))
+            trimmed = ordered[:max_preview]
+            return sorted(set(float(s) for s in trimmed))
+
+        ce_all = [float(s) for s in strikes_by_type.get('CE', [])]
+        pe_all = [float(s) for s in strikes_by_type.get('PE', [])]
+        response = {
+            'success': True,
+            'symbol': symbol,
+            'cmp': float(cmp_value),
+            'strikeRange': int(strike_range),
+            'expiry': expiry.isoformat() if hasattr(expiry, 'isoformat') else str(expiry),
+            'strikeStep': float(engine._strike_step(symbol)),
+            'totals': {
+                'ce': len(ce_all),
+                'pe': len(pe_all)
+            },
+            'preview': {
+                'ce': _preview(ce_all),
+                'pe': _preview(pe_all)
+            },
+            'truncated': {
+                'ce': len(ce_all) > max_preview if max_preview > 0 else False,
+                'pe': len(pe_all) > max_preview if max_preview > 0 else False
+            }
+        }
+        return jsonify(response)
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@scanner_bp.route('/api/backtest/logs/latest', methods=['GET'])
+@login_required
+def download_latest_backtest_log_scanner():
+    """Compatibility route for downloading latest backtest log."""
+    logs_dir = Path('logs')
+    if not logs_dir.exists() or not logs_dir.is_dir():
+        return jsonify({'success': False, 'error': 'Log directory not found.'}), 404
+
+    prefix = f'backtest_scan_user_{current_user.id}_'
+    candidates = []
+    for path in logs_dir.iterdir():
+        if not path.is_file():
+            continue
+        if not path.name.startswith(prefix) or not path.name.endswith('.log'):
+            continue
+        candidates.append(path)
+
+    if not candidates:
+        return jsonify({'success': False, 'error': 'No backtest log file found for this user yet.'}), 404
+
+    latest = max(candidates, key=lambda p: p.stat().st_mtime).resolve()
+    if not latest.exists():
+        return jsonify({'success': False, 'error': 'Latest backtest log file was not found on disk.'}), 404
+    return send_file(
+        latest,
+        as_attachment=True,
+        download_name=latest.name,
+        mimetype='text/plain'
+    )
+
+
+@scanner_bp.route('/api/error-logs/latest', methods=['GET'])
+@login_required
+def download_latest_error_log_scanner():
+    """Compatibility route for downloading latest API error log."""
+    logs_dir = Path('logs')
+    if not logs_dir.exists() or not logs_dir.is_dir():
+        return jsonify({'success': False, 'error': 'Log directory not found.'}), 404
+
+    prefix = f'api_error_user_{current_user.id}_'
+    candidates = []
+    for path in logs_dir.iterdir():
+        if not path.is_file():
+            continue
+        if not path.name.startswith(prefix) or not path.name.endswith('.log'):
+            continue
+        candidates.append(path)
+
+    if not candidates:
+        return jsonify({'success': False, 'error': 'No API error log file found for this user yet.'}), 404
+
+    latest = max(candidates, key=lambda p: p.stat().st_mtime).resolve()
+    if not latest.exists():
+        return jsonify({'success': False, 'error': 'Latest error log file was not found on disk.'}), 404
+    return send_file(
+        latest,
+        as_attachment=True,
+        download_name=latest.name,
+        mimetype='text/plain'
+    )
+
+
+@scanner_bp.route('/api/backtest/logs/latest-csv', methods=['GET'])
+@login_required
+def download_latest_backtest_log_csv_scanner():
+    """Compatibility route for downloading latest backtest CSV diagnostic log."""
+    logs_dir = Path('logs')
+    if not logs_dir.exists() or not logs_dir.is_dir():
+        return jsonify({'success': False, 'error': 'Log directory not found.'}), 404
+
+    prefix = f'backtest_scan_user_{current_user.id}_'
+    candidates = []
+    for path in logs_dir.iterdir():
+        if not path.is_file():
+            continue
+        if not path.name.startswith(prefix) or not path.name.endswith('.csv'):
+            continue
+        candidates.append(path)
+
+    if not candidates:
+        return jsonify({'success': False, 'error': 'No backtest CSV log file found for this user yet.'}), 404
+
+    latest = max(candidates, key=lambda p: p.stat().st_mtime).resolve()
+    if not latest.exists():
+        return jsonify({'success': False, 'error': 'Latest backtest CSV log file was not found on disk.'}), 404
+    return send_file(
+        latest,
+        as_attachment=True,
+        download_name=latest.name,
+        mimetype='text/csv'
+    )
 
 
 @scanner_bp.route('/api/debug/start-live/<int:user_id>', methods=['POST'])

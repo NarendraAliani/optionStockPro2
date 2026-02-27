@@ -32,6 +32,7 @@ DEFAULT_SCAN_WORKERS = 8
 MAX_SCAN_WORKERS = 16
 DEFAULT_PROFILE = 'balanced'
 VALID_SCAN_PROFILES = ('conservative', 'balanced', 'aggressive')
+VALID_REBALANCE_FREQUENCIES = ('daily', 'weekly', 'monthly')
 
 
 def _clamp_scan_workers(value, default=DEFAULT_SCAN_WORKERS):
@@ -72,10 +73,17 @@ def _normalized_profile(value):
     return token
 
 
+def _normalized_rebalance_frequency(value):
+    token = str(value or 'weekly').strip().lower()
+    if token not in VALID_REBALANCE_FREQUENCIES:
+        return 'weekly'
+    return token
+
+
 def _suggested_scan_workers():
     cpu = os.cpu_count() or DEFAULT_SCAN_WORKERS
     # API-bound workload: keep recommendation moderate to avoid rate-limit pressure.
-    return max(DEFAULT_SCAN_WORKERS, min(MAX_SCAN_WORKERS, cpu * 2))
+    return max(DEFAULT_SCAN_WORKERS, min(MAX_SCAN_WORKERS, cpu))
 
 
 class APICredentialForm(FlaskForm):
@@ -538,8 +546,15 @@ def preferences():
         live_prefilter_top_movers = _clamp_int(request.form.get('live_prefilter_top_movers'), 0, 500, 30)
         live_prefilter_top_volume = _clamp_int(request.form.get('live_prefilter_top_volume'), 0, 500, 30)
         live_prefilter_max_stocks = _clamp_int(request.form.get('live_prefilter_max_stocks'), 1, 500, 50)
+        backtest_rebalance_frequency = _normalized_rebalance_frequency(request.form.get('backtest_rebalance_frequency', 'weekly'))
+        backtest_strict_first_candle = _form_bool(request.form, 'backtest_strict_first_candle', default=True)
+        backtest_liquidity_filter_enabled = _form_bool(request.form, 'backtest_liquidity_filter_enabled', default=True)
+        backtest_min_candles_per_strike = _clamp_int(request.form.get('backtest_min_candles_per_strike'), 2, 500, 5)
+        backtest_min_avg_volume = _clamp_int(request.form.get('backtest_min_avg_volume'), 0, 1_000_000, 1)
         guardrail_enabled = _form_bool(request.form, 'guardrail_enabled', default=True)
         guardrail_load_threshold = _clamp_int(request.form.get('guardrail_load_threshold'), 100, 25000, 1200)
+        backtest_scan_log_enabled = _form_bool(request.form, 'backtest_scan_log_enabled', default=False)
+        api_error_log_enabled = _form_bool(request.form, 'api_error_log_enabled', default=False)
         current_user.theme_preference = theme
         current_user.scan_workers = scan_workers
         current_user.live_workers_cap = live_workers_cap
@@ -550,8 +565,15 @@ def preferences():
         current_user.live_prefilter_top_movers = live_prefilter_top_movers
         current_user.live_prefilter_top_volume = live_prefilter_top_volume
         current_user.live_prefilter_max_stocks = live_prefilter_max_stocks
+        current_user.backtest_rebalance_frequency = backtest_rebalance_frequency
+        current_user.backtest_strict_first_candle = backtest_strict_first_candle
+        current_user.backtest_liquidity_filter_enabled = backtest_liquidity_filter_enabled
+        current_user.backtest_min_candles_per_strike = backtest_min_candles_per_strike
+        current_user.backtest_min_avg_volume = backtest_min_avg_volume
         current_user.guardrail_enabled = guardrail_enabled
         current_user.guardrail_load_threshold = guardrail_load_threshold
+        current_user.backtest_scan_log_enabled = backtest_scan_log_enabled
+        current_user.api_error_log_enabled = api_error_log_enabled
         db.session.commit()
         flash('Preferences updated!', 'success')
         return redirect(url_for('dashboard.index'))
@@ -563,7 +585,8 @@ def preferences():
         max_scan_workers=MAX_SCAN_WORKERS,
         suggested_scan_workers=_suggested_scan_workers(),
         default_profile=DEFAULT_PROFILE,
-        scan_profiles=VALID_SCAN_PROFILES
+        scan_profiles=VALID_SCAN_PROFILES,
+        rebalance_frequencies=VALID_REBALANCE_FREQUENCIES
     )
 
 

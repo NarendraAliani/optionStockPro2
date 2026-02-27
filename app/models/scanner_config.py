@@ -14,7 +14,8 @@ class ScannerConfig(db.Model):
     user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
     config_name = db.Column(db.String(100), nullable=False)
     stock_selection = db.Column(db.JSON)  # ["NIFTY", "BANKNIFTY"] or "ALL"
-    strike_range = db.Column(db.Integer, default=5)
+    # 0 means scan all available strikes from the NFO option universe.
+    strike_range = db.Column(db.Integer, default=0)
     price_multiplier = db.Column(db.Numeric(5, 2), default=2.00)
     timeframe = db.Column(db.String(10), default='5min')
     refresh_interval = db.Column(db.Integer, default=300)  # seconds

@@ -135,6 +135,58 @@
                         </div>
                     </div>
 
+                    <div class="mb-3">
+                        <label for="backtest_rebalance_frequency" class="form-label">Backtest Rebalance Frequency</label>
+                        <select class="form-select" id="backtest_rebalance_frequency" name="backtest_rebalance_frequency">
+                            {% set active_rebalance_frequency = user.backtest_rebalance_frequency or 'weekly' %}
+                            {% for freq in rebalance_frequencies %}
+                                <option value="{{ freq }}" {% if active_rebalance_frequency == freq %}selected{% endif %}>
+                                    {{ freq|capitalize }}
+                                </option>
+                            {% endfor %}
+                        </select>
+                        <small class="text-muted">How often CMP baseline is refreshed for strike selection.</small>
+                    </div>
+
+                    <div class="form-check form-switch mb-3">
+                        <input type="hidden" name="backtest_strict_first_candle" value="0">
+                        <input class="form-check-input" type="checkbox" id="backtest_strict_first_candle" name="backtest_strict_first_candle" value="1" {% if user.backtest_strict_first_candle is not sameas false %}checked{% endif %}>
+                        <label class="form-check-label" for="backtest_strict_first_candle">Use First Candle Of Window As Baseline (No Lookahead)</label>
+                    </div>
+
+                    <div class="form-check form-switch mb-3">
+                        <input type="hidden" name="backtest_liquidity_filter_enabled" value="0">
+                        <input class="form-check-input" type="checkbox" id="backtest_liquidity_filter_enabled" name="backtest_liquidity_filter_enabled" value="1" {% if user.backtest_liquidity_filter_enabled is not sameas false %}checked{% endif %}>
+                        <label class="form-check-label" for="backtest_liquidity_filter_enabled">Enable Backtest Liquidity Filter</label>
+                    </div>
+
+                    <div class="row">
+                        <div class="col-md-6 mb-3">
+                            <label for="backtest_min_candles_per_strike" class="form-label">Minimum Candles Per Strike</label>
+                            <input
+                                type="number"
+                                class="form-control"
+                                id="backtest_min_candles_per_strike"
+                                name="backtest_min_candles_per_strike"
+                                min="2"
+                                max="500"
+                                value="{{ user.backtest_min_candles_per_strike or 5 }}"
+                            >
+                        </div>
+                        <div class="col-md-6 mb-3">
+                            <label for="backtest_min_avg_volume" class="form-label">Minimum Average Volume</label>
+                            <input
+                                type="number"
+                                class="form-control"
+                                id="backtest_min_avg_volume"
+                                name="backtest_min_avg_volume"
+                                min="0"
+                                max="1000000"
+                                value="{{ user.backtest_min_avg_volume or 1 }}"
+                            >
+                        </div>
+                    </div>
+
                     <div class="form-check form-switch mb-3">
                         <input type="hidden" name="guardrail_enabled" value="0">
                         <input class="form-check-input" type="checkbox" id="guardrail_enabled" name="guardrail_enabled" value="1" {% if user.guardrail_enabled is not sameas false %}checked{% endif %}>
@@ -154,6 +206,28 @@
                         >
                         <small class="text-muted">
                             When estimated load exceeds this, UI shows a confirmation warning before start.
+                        </small>
+                    </div>
+
+                    <div class="mb-3">
+                        <label for="backtest_scan_log_enabled" class="form-label">Create Logfile?</label>
+                        <select class="form-select" id="backtest_scan_log_enabled" name="backtest_scan_log_enabled">
+                            <option value="1" {% if user.backtest_scan_log_enabled %}selected{% endif %}>Yes</option>
+                            <option value="0" {% if not user.backtest_scan_log_enabled %}selected{% endif %}>No</option>
+                        </select>
+                        <small class="text-muted">
+                            When enabled, backtest writes a detailed log of each scanned strike/candle under the logs folder.
+                        </small>
+                    </div>
+
+                    <div class="mb-3">
+                        <label for="api_error_log_enabled" class="form-label">Create API Error Log?</label>
+                        <select class="form-select" id="api_error_log_enabled" name="api_error_log_enabled">
+                            <option value="1" {% if user.api_error_log_enabled %}selected{% endif %}>Yes</option>
+                            <option value="0" {% if not user.api_error_log_enabled %}selected{% endif %}>No</option>
+                        </select>
+                        <small class="text-muted">
+                            When enabled, live/backtest scan API failures are captured with context in logs.
                         </small>
                     </div>
                     

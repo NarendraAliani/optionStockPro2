@@ -44,7 +44,8 @@ class SmartConnect(object):
         "api.gtt.details":"/rest/secure/angelbroking/gtt/v1/ruleDetails",
         "api.gtt.list":"/rest/secure/angelbroking/gtt/v1/ruleList",
 
-        "api.candle.data":"/rest/secure/angelbroking/historical/v1/getCandleData"
+        "api.candle.data":"/rest/secure/angelbroking/historical/v1/getCandleData",
+        "api.market.optiongreeks":"/rest/secure/angelbroking/marketData/v1/optionGreek"
     }
 
 
@@ -396,7 +397,14 @@ class SmartConnect(object):
                 del(params[k])
         getCandleDataResponse=self._postRequest("api.candle.data",historicDataParams)
         return getCandleDataResponse
+
+    def optionGreek(self, optionGreekParams):
+        params = optionGreekParams
+        for k in list(params.keys()):
+            if params[k] is None:
+                del(params[k])
+        optionGreekResponse = self._postRequest("api.market.optiongreeks", params)
+        return optionGreekResponse
         
     def _user_agent(self):
         return (__title__ + "-python/").capitalize() + __version__   
-

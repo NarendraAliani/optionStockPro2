@@ -12,6 +12,7 @@ from logging.handlers import RotatingFileHandler
 import os
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+from sqlalchemy.exc import OperationalError
 from app.services.angel_api import download_scrip_master, get_scrip_master_status
 
 # Initialize extensions
@@ -52,9 +53,45 @@ def create_app(config_name='default'):
     
     # User loader
     from app.models.user import User
+
+    def _is_disconnect_error(error):
+        message = str(error).lower()
+        disconnect_markers = (
+            'lost connection to mysql server during query',
+            'server has gone away',
+            'connection was forcibly closed by the remote host',
+            'broken pipe',
+            'connection reset by peer'
+        )
+        return any(marker in message for marker in disconnect_markers)
+
     @login_manager.user_loader
     def load_user(user_id):
-        return User.query.get(int(user_id))
+        try:
+            user_id = int(user_id)
+        except (TypeError, ValueError):
+            return None
+
+        # Retry once if the pooled connection is stale or transiently dropped.
+        for attempt in range(2):
+            try:
+                return db.session.get(User, user_id)
+            except OperationalError as exc:
+                if not _is_disconnect_error(exc):
+                    app.logger.exception('Failed to load user %s', user_id)
+                    return None
+
+                app.logger.warning(
+                    'Transient DB disconnect while loading user %s (attempt %s/2): %s',
+                    user_id, attempt + 1, exc
+                )
+                try:
+                    db.session.rollback()
+                except Exception:
+                    pass
+                db.session.remove()
+
+        return None
     
     # Register blueprints
     from app.routes.auth import auth_bp

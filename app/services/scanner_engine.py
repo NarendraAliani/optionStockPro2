@@ -4,13 +4,18 @@ Scanner Engine Service
 from app.services.angel_api import AngelOneAPI
 from app.services.signal_detector import SignalDetector
 from app.services.data_processor import DataProcessor
+from app.services.telegram_notifier import send_signal_notification
 from app.models.signal import Signal
 from app.models.signal_detail import SignalDetail
 from app import db, socketio
 from datetime import datetime, date, timezone, timedelta
+from collections import OrderedDict
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Event, Lock
 import os
+import csv
+import json
 import logging
 import re
 from sqlalchemy import inspect as sa_inspect
@@ -41,7 +46,14 @@ class ScannerEngine:
         live_prefilter_enabled=None,
         live_prefilter_top_movers=None,
         live_prefilter_top_volume=None,
-        live_prefilter_max_stocks=None
+        live_prefilter_max_stocks=None,
+        backtest_rebalance_frequency='weekly',
+        backtest_strict_first_candle=True,
+        backtest_liquidity_filter_enabled=True,
+        backtest_min_candles_per_strike=5,
+        backtest_min_avg_volume=1,
+        backtest_scan_log_enabled=False,
+        api_error_log_enabled=False
     ):
         """
         Initialize scanner engine
@@ -61,8 +73,13 @@ class ScannerEngine:
         self.last_cycle_stocks_total = 0
         self.last_cycle_strikes_scanned = 0
         self.last_cycle_strikes_total = 0
+        self.last_cycle_skipped_candles = 0
         self.last_backtest_scripts_scanned = 0
         self.last_backtest_scripts_total = 0
+        self.last_backtest_strikes_scanned = 0
+        self.last_backtest_strikes_total = 0
+        self.last_backtest_instruments_missing = 0
+        self.last_backtest_candles_missing = 0
         self.last_backtest_signals = 0
         self._last_processed_live_candle = None
         self._expiry_cache = {}
@@ -88,6 +105,28 @@ class ScannerEngine:
         self.max_workers = max(1, min(16, self._safe_int(workers, 8)))
         self._stop_event = Event()
         self._live_signal_lock = Lock()
+        freq_token = str(backtest_rebalance_frequency or 'weekly').strip().lower()
+        if freq_token not in ('daily', 'weekly', 'monthly'):
+            freq_token = 'weekly'
+        self._backtest_rebalance_frequency = freq_token
+        self._backtest_strict_first_candle = bool(backtest_strict_first_candle)
+        self._backtest_liquidity_filter_enabled = bool(backtest_liquidity_filter_enabled)
+        self._backtest_min_candles_per_strike = max(2, self._safe_int(backtest_min_candles_per_strike, 5))
+        self._backtest_min_avg_volume = max(0, self._safe_int(backtest_min_avg_volume, 1))
+        self._backtest_scan_log_enabled = bool(backtest_scan_log_enabled)
+        self._backtest_log_lock = Lock()
+        self._backtest_log_handle = None
+        self._backtest_log_path = None
+        self._backtest_csv_handle = None
+        self._backtest_csv_writer = None
+        self._backtest_csv_path = None
+        self._api_error_log_enabled = bool(api_error_log_enabled)
+        self._api_error_log_lock = Lock()
+        self._cmp_min = float(os.getenv('LIVE_CMP_MIN', '200') or 200)
+        self._cmp_max = float(os.getenv('LIVE_CMP_MAX', '20000') or 20000)
+        self._historical_cache = OrderedDict()
+        self._historical_cache_max = self._safe_int(os.getenv('HISTORICAL_CACHE_MAX', '2000'), 2000)
+        self._last_api_stats_log_at = 0.0
     
     def start_live_scan(self):
         """Start live scanning"""
@@ -130,7 +169,8 @@ class ScannerEngine:
                         stocks_scanned=self.last_cycle_stocks_scanned,
                         stocks_total=self.last_cycle_stocks_total,
                         strikes_scanned=self.last_cycle_strikes_scanned,
-                        strikes_total=self.last_cycle_strikes_total
+                        strikes_total=self.last_cycle_strikes_total,
+                        skipped_candles=self.last_cycle_skipped_candles
                     )
                 if signals:
                     for signal in signals:
@@ -140,8 +180,15 @@ class ScannerEngine:
                             payload,
                             to=f'user_{self.user_id}'
                         )
+                        send_signal_notification(payload, mode='live', user_id=self.user_id)
+                self._log_api_activity('live')
             except Exception as e:
                 logger.error(f'Live scan error: {str(e)}')
+                self._write_api_error_log(
+                    mode='live',
+                    event='live_loop_exception',
+                    details={'error': str(e)}
+                )
                 if status_callback:
                     status_callback(self.user_id, error=str(e))
             if self._wait_with_abort(refresh_interval):
@@ -158,13 +205,16 @@ class ScannerEngine:
         self.last_cycle_stocks_scanned = 0
         self.last_cycle_strikes_total = 0
         self.last_cycle_strikes_scanned = 0
+        self.last_cycle_skipped_candles = 0
+        cmp_skipped = 0
         if progress_callback:
             progress_callback(
                 self.user_id,
                 stocks_scanned=0,
                 stocks_total=self.last_cycle_stocks_total,
                 strikes_scanned=0,
-                strikes_total=0
+                strikes_total=0,
+                skipped_candles=0
             )
         timeframe = self._normalize_timeframe()
         symbol_jobs = []
@@ -180,8 +230,12 @@ class ScannerEngine:
             if not spot or spot.get('ltp') is None:
                 symbol_jobs.append({'symbol': symbol, 'expiry': expiry, 'strikes_by_type': {'CE': [], 'PE': []}})
                 continue
+            spot_ltp = float(spot.get('ltp') or 0)
+            if spot_ltp < self._cmp_min or spot_ltp > self._cmp_max:
+                cmp_skipped += 1
+                continue
 
-            strikes_by_type = self._resolve_strikes_by_type(symbol, expiry, float(spot['ltp']))
+            strikes_by_type = self._resolve_strikes_by_type(symbol, expiry, spot_ltp)
             symbol_jobs.append({'symbol': symbol, 'expiry': expiry, 'strikes_by_type': strikes_by_type})
 
         self.last_cycle_strikes_total = sum(
@@ -194,7 +248,15 @@ class ScannerEngine:
                 stocks_scanned=self.last_cycle_stocks_scanned,
                 stocks_total=self.last_cycle_stocks_total,
                 strikes_scanned=self.last_cycle_strikes_scanned,
-                strikes_total=self.last_cycle_strikes_total
+                strikes_total=self.last_cycle_strikes_total,
+                skipped_candles=self.last_cycle_skipped_candles
+            )
+        if cmp_skipped and not self._prefilter_enabled:
+            logger.info(
+                'Live scan skipped %s stocks due to CMP outside range [%s, %s].',
+                cmp_skipped,
+                int(self._cmp_min),
+                int(self._cmp_max)
             )
 
         detected = []
@@ -218,11 +280,19 @@ class ScannerEngine:
                 self.last_cycle_stocks_scanned += 1
                 symbol_detected = []
                 strikes_scanned = 0
+                skipped_candles = 0
                 try:
-                    symbol_detected, strikes_scanned = future.result()
+                    result = future.result()
+                    if isinstance(result, tuple):
+                        symbol_detected = result[0] or []
+                        strikes_scanned = self._safe_int(result[1], 0) if len(result) > 1 else 0
+                        skipped_candles = self._safe_int(result[2], 0) if len(result) > 2 else 0
+                    else:
+                        symbol_detected = result or []
                 except Exception as e:
                     logger.error('Live scan worker failed for %s: %s', future_map.get(future), str(e))
                 self.last_cycle_strikes_scanned += self._safe_int(strikes_scanned, 0)
+                self.last_cycle_skipped_candles += self._safe_int(skipped_candles, 0)
                 if symbol_detected:
                     detected.extend(symbol_detected)
                 if progress_callback:
@@ -231,7 +301,8 @@ class ScannerEngine:
                         stocks_scanned=self.last_cycle_stocks_scanned,
                         stocks_total=self.last_cycle_stocks_total,
                         strikes_scanned=self.last_cycle_strikes_scanned,
-                        strikes_total=self.last_cycle_strikes_total
+                        strikes_total=self.last_cycle_strikes_total,
+                        skipped_candles=self.last_cycle_skipped_candles
                     )
                 if not self.is_running or self._stop_event.is_set():
                     aborted = True
@@ -263,8 +334,13 @@ class ScannerEngine:
         stocks = self._resolve_stock_selection()
         self.last_backtest_scripts_scanned = 0
         self.last_backtest_scripts_total = len(stocks)
+        self.last_backtest_strikes_scanned = 0
+        self.last_backtest_strikes_total = 0
+        self.last_backtest_instruments_missing = 0
+        self.last_backtest_candles_missing = 0
         self.last_backtest_signals = 0
         timeframe = self._normalize_timeframe()
+        self._open_backtest_scan_log(from_date=from_date, to_date=to_date, timeframe=timeframe, stocks=stocks)
         executor = ThreadPoolExecutor(max_workers=self.max_workers)
         aborted = False
         try:
@@ -280,6 +356,8 @@ class ScannerEngine:
                         'mode': 'backtest',
                         'scripts_scanned': int(self.last_backtest_scripts_scanned),
                         'scripts_total': int(self.last_backtest_scripts_total),
+                        'strikes_scanned': int(self.last_backtest_strikes_scanned),
+                        'strikes_total': int(self.last_backtest_strikes_total),
                         'signals': int(self.last_backtest_signals),
                         'running': bool(self.is_running),
                         'updated_at': datetime.utcnow().isoformat() + 'Z'
@@ -288,26 +366,47 @@ class ScannerEngine:
                 )
 
                 symbol_detected = []
+                symbol_strikes_scanned = 0
+                symbol_strikes_total = 0
+                symbol_instruments_missing = 0
+                symbol_candles_missing = 0
                 try:
-                    symbol_detected = future.result() or []
+                    result = future.result()
+                    if isinstance(result, tuple):
+                        symbol_detected = result[0] or []
+                        symbol_strikes_scanned = self._safe_int(result[1], 0) if len(result) > 1 else 0
+                        symbol_strikes_total = self._safe_int(result[2], 0) if len(result) > 2 else 0
+                        symbol_instruments_missing = self._safe_int(result[3], 0) if len(result) > 3 else 0
+                        symbol_candles_missing = self._safe_int(result[4], 0) if len(result) > 4 else 0
+                    else:
+                        symbol_detected = result or []
                 except Exception as e:
                     logger.error('Backtest worker failed for %s: %s', future_map.get(future), str(e))
+                self.last_backtest_strikes_scanned += self._safe_int(symbol_strikes_scanned, 0)
+                self.last_backtest_strikes_total += self._safe_int(symbol_strikes_total, 0)
+                self.last_backtest_instruments_missing += self._safe_int(symbol_instruments_missing, 0)
+                self.last_backtest_candles_missing += self._safe_int(symbol_candles_missing, 0)
 
                 if symbol_detected:
                     self._persist_signals(symbol_detected, mode='backtest')
                     self.last_backtest_signals += len(symbol_detected)
                     detected.extend(symbol_detected)
                     for signal in symbol_detected:
+                        payload = self._serialize_realtime_signal(signal)
                         socketio.emit(
                             'new_signal',
-                            self._serialize_realtime_signal(signal),
+                            payload,
                             to=f'user_{self.user_id}'
                         )
+                        send_signal_notification(payload, mode='backtest', user_id=self.user_id)
+                self._log_api_activity('backtest')
 
                 if progress_callback:
                     progress_callback(
                         self.user_id,
                         scripts_scanned=self.last_backtest_scripts_scanned,
+                        strikes_scanned=self.last_backtest_strikes_scanned,
+                        strikes_total=self.last_backtest_strikes_total,
                         signals=self.last_backtest_signals
                     )
 
@@ -316,6 +415,18 @@ class ScannerEngine:
                     break
         finally:
             executor.shutdown(wait=not aborted, cancel_futures=aborted)
+            self._close_backtest_scan_log(
+                summary={
+                    'scripts_scanned': int(self.last_backtest_scripts_scanned or 0),
+                    'scripts_total': int(self.last_backtest_scripts_total or 0),
+                    'strikes_scanned': int(self.last_backtest_strikes_scanned or 0),
+                    'strikes_total': int(self.last_backtest_strikes_total or 0),
+                    'instruments_missing': int(self.last_backtest_instruments_missing or 0),
+                    'candles_missing': int(self.last_backtest_candles_missing or 0),
+                    'signals': int(self.last_backtest_signals or 0),
+                    'aborted': bool(aborted or self._stop_event.is_set())
+                }
+            )
 
         # Keep explicit final counters available in status.
         self.last_backtest_signals = int(self.last_backtest_signals or 0)
@@ -325,14 +436,15 @@ class ScannerEngine:
 
     def _scan_live_symbol(self, symbol, expiry, strikes_by_type, timeframe):
         if not self.is_running or self._stop_event.is_set() or not expiry:
-            return [], 0
+            return [], 0, 0
 
         strikes_processed = 0
+        skipped_candles = 0
         symbol_detected = []
         for option_type in ('CE', 'PE'):
             for strike in strikes_by_type.get(option_type, []):
                 if not self.is_running or self._stop_event.is_set():
-                    return symbol_detected, strikes_processed
+                    return symbol_detected, strikes_processed, skipped_candles
                 strikes_processed += 1
                 option_snapshot = self.angel_api.get_recent_option_candle_pair(
                     underlying=symbol,
@@ -343,6 +455,27 @@ class ScannerEngine:
                     exchange='NFO'
                 )
                 if not option_snapshot:
+                    option_snapshot = self._get_live_option_snapshot_force_check(
+                        symbol=symbol,
+                        expiry=expiry,
+                        strike=strike,
+                        option_type=option_type,
+                        timeframe=timeframe
+                    )
+                if not option_snapshot:
+                    skipped_candles += 1
+                    self._write_api_error_log(
+                        mode='live',
+                        event='option_snapshot_missing',
+                        details={
+                            'symbol': symbol,
+                            'expiry': expiry.isoformat() if hasattr(expiry, 'isoformat') else str(expiry),
+                            'option_type': option_type,
+                            'strike': float(strike),
+                            'timeframe': timeframe,
+                            'api_last_error': getattr(self.angel_api, 'last_error', None)
+                        }
+                    )
                     continue
 
                 signal_payload = {
@@ -373,86 +506,743 @@ class ScannerEngine:
                 signal['detected_at'] = candle_time or datetime.utcnow()
                 signal['displayed_at'] = datetime.utcnow()
                 symbol_detected.append(signal)
-        return symbol_detected, strikes_processed
+        return symbol_detected, strikes_processed, skipped_candles
 
     def _run_backtest_symbol(self, symbol, from_date, to_date, timeframe):
         if not self.is_running or self._stop_event.is_set():
-            return []
+            return [], 0, 0, 0, 0
 
         symbol_detected = []
-        expiry = self._resolve_expiry(symbol, reference_date=from_date)
-        if not expiry:
-            return symbol_detected
+        strikes_scanned = 0
+        strikes_total = 0
+        instruments_missing = 0
+        candles_missing = 0
+        segments = self._build_backtest_expiry_segments(symbol, from_date, to_date)
+        if not segments:
+            self._write_backtest_scan_log(
+                'skip_symbol',
+                {
+                    'symbol': symbol,
+                    'reason': 'expiry_schedule_not_found',
+                    'from_date': str(from_date),
+                    'to_date': str(to_date)
+                }
+            )
+            self._write_backtest_scan_csv(
+                'skip_symbol',
+                {
+                    'symbol': symbol,
+                    'window_from': str(from_date),
+                    'window_to': str(to_date),
+                    'skip_reason': 'expiry_schedule_not_found',
+                    'price_multiplier': float(getattr(self.config, 'price_multiplier', 0) or 0),
+                    'note': ''
+                }
+            )
+            return symbol_detected, strikes_scanned, strikes_total, instruments_missing, candles_missing
 
-        spot = self.angel_api.get_live_quote(symbol, exchange='NSE')
-        if not spot or spot.get('ltp') is None:
-            return symbol_detected
+        for segment_from, segment_to, expiry in segments:
+            if not self.is_running or self._stop_event.is_set():
+                return symbol_detected, strikes_scanned, strikes_total, instruments_missing, candles_missing
 
-        strikes_by_type = self._resolve_strikes_by_type(symbol, expiry, float(spot['ltp']))
-        for option_type in ('CE', 'PE'):
-            for strike in strikes_by_type.get(option_type, []):
+            self._write_backtest_scan_log(
+                'scan_expiry_segment',
+                {
+                    'symbol': symbol,
+                    'segment_from': segment_from.isoformat() if hasattr(segment_from, 'isoformat') else str(segment_from),
+                    'segment_to': segment_to.isoformat() if hasattr(segment_to, 'isoformat') else str(segment_to),
+                    'expiry': expiry.isoformat() if hasattr(expiry, 'isoformat') else str(expiry)
+                }
+            )
+            self._write_backtest_scan_csv(
+                'scan_expiry_segment',
+                {
+                    'symbol': symbol,
+                    'expiry': expiry.isoformat() if hasattr(expiry, 'isoformat') else str(expiry),
+                    'window_from': segment_from.isoformat() if hasattr(segment_from, 'isoformat') else str(segment_from),
+                    'window_to': segment_to.isoformat() if hasattr(segment_to, 'isoformat') else str(segment_to),
+                    'price_multiplier': float(getattr(self.config, 'price_multiplier', 0) or 0),
+                    'note': ''
+                }
+            )
+
+            segment_spot_fallback = self._infer_spot_from_strike_universe(symbol, expiry)
+            rebalance_schedule = self._resolve_backtest_cmp_schedule(
+                symbol=symbol,
+                start_dt=segment_from,
+                end_dt=segment_to,
+                base_timeframe=timeframe
+            )
+            if not rebalance_schedule:
+                rebalance_schedule = [(segment_from, segment_to, None)]
+
+            for window_from, window_to, baseline_cmp in rebalance_schedule:
                 if not self.is_running or self._stop_event.is_set():
-                    return symbol_detected
+                    return symbol_detected, strikes_scanned, strikes_total, instruments_missing, candles_missing
 
-                instrument = self.angel_api.lookup_option_instrument(
-                    underlying=symbol,
-                    expiry=expiry,
-                    strike=strike,
-                    option_type=option_type,
-                    exchange='NFO'
-                )
-                if not instrument:
-                    continue
-
-                candles = self.angel_api.get_historical_data(
-                    symbol=instrument['symbol'],
-                    timeframe=timeframe,
-                    from_date=from_date,
-                    to_date=to_date,
-                    exchange='NFO',
-                    symbol_token=instrument['token']
-                )
-                if not candles or len(candles) < 2:
-                    continue
-
-                for i in range(1, len(candles)):
-                    if not self.is_running or self._stop_event.is_set():
-                        return symbol_detected
-                    prev_time = self._parse_candle_time(candles[i - 1][0])
-                    current_time = self._parse_candle_time(candles[i][0])
-                    if not prev_time or not current_time:
-                        continue
-                    previous_close = float(candles[i - 1][4])
-                    current_close = float(candles[i][4])
-                    rsi = self._calculate_rsi(candles[:i + 1], period=14)
-                    option_data = {
-                        'symbol': instrument['symbol'],
-                        'option_type': option_type,
-                        'strike_price': strike,
-                        'ltp': current_close,
-                        'previous_candle_close': previous_close,
-                        'candle_open': float(candles[i][1]) if len(candles[i]) > 1 else None,
-                        'candle_high': float(candles[i][2]) if len(candles[i]) > 2 else None,
-                        'candle_low': float(candles[i][3]) if len(candles[i]) > 3 else None,
-                        'candle_close': current_close,
-                        'volume': int(float(candles[i][5])) if len(candles[i]) > 5 else 0,
-                        'open_interest': 0,
-                        'rsi': rsi
-                    }
-                    signal = SignalDetector.detect_signal(option_data, self.config)
-                    if not signal:
-                        continue
-                    signal['strike_price'] = self._normalize_signal_strike(
-                        signal.get('strike_price'),
-                        signal.get('symbol')
+                active_spot_ltp = baseline_cmp if baseline_cmp is not None else segment_spot_fallback
+                if active_spot_ltp is None:
+                    self._write_backtest_scan_log(
+                        'skip_rebalance_window',
+                        {
+                            'symbol': symbol,
+                            'reason': 'baseline_cmp_not_available',
+                            'expiry': expiry.isoformat() if hasattr(expiry, 'isoformat') else str(expiry),
+                            'window_from': window_from.isoformat() if hasattr(window_from, 'isoformat') else str(window_from),
+                            'window_to': window_to.isoformat() if hasattr(window_to, 'isoformat') else str(window_to),
+                            'frequency': self._backtest_rebalance_frequency
+                        }
                     )
-                    signal['expiry_date'] = expiry
-                    signal['detected_at'] = current_time
-                    signal['displayed_at'] = datetime.utcnow()
-                    signal['mode'] = 'backtest'
-                    symbol_detected.append(signal)
+                    self._write_backtest_scan_csv(
+                        'skip_rebalance_window',
+                        {
+                            'symbol': symbol,
+                            'expiry': expiry.isoformat() if hasattr(expiry, 'isoformat') else str(expiry),
+                            'window_from': window_from.isoformat() if hasattr(window_from, 'isoformat') else str(window_from),
+                            'window_to': window_to.isoformat() if hasattr(window_to, 'isoformat') else str(window_to),
+                            'skip_reason': 'baseline_cmp_not_available',
+                            'price_multiplier': float(getattr(self.config, 'price_multiplier', 0) or 0),
+                            'note': f'frequency={self._backtest_rebalance_frequency}'
+                        }
+                    )
+                    self._write_api_error_log(
+                        mode='backtest',
+                        event='spot_not_available',
+                        details={
+                            'symbol': symbol,
+                            'expiry': expiry.isoformat() if hasattr(expiry, 'isoformat') else str(expiry),
+                            'window_from': window_from.isoformat() if hasattr(window_from, 'isoformat') else str(window_from),
+                            'window_to': window_to.isoformat() if hasattr(window_to, 'isoformat') else str(window_to),
+                            'frequency': self._backtest_rebalance_frequency,
+                            'api_last_error': getattr(self.angel_api, 'last_error', None)
+                        }
+                    )
+                    continue
 
-        return symbol_detected
+                self._write_backtest_scan_log(
+                    'rebalance_cmp_selected',
+                    {
+                        'symbol': symbol,
+                        'expiry': expiry.isoformat() if hasattr(expiry, 'isoformat') else str(expiry),
+                        'window_from': window_from.isoformat() if hasattr(window_from, 'isoformat') else str(window_from),
+                        'window_to': window_to.isoformat() if hasattr(window_to, 'isoformat') else str(window_to),
+                        'frequency': self._backtest_rebalance_frequency,
+                        'strict_first_candle': bool(self._backtest_strict_first_candle),
+                        'cmp': float(active_spot_ltp),
+                        'source': 'historical_underlying' if baseline_cmp is not None else 'strike_universe_fallback'
+                    }
+                )
+                self._write_backtest_scan_csv(
+                    'rebalance_cmp_selected',
+                    {
+                        'symbol': symbol,
+                        'expiry': expiry.isoformat() if hasattr(expiry, 'isoformat') else str(expiry),
+                        'window_from': window_from.isoformat() if hasattr(window_from, 'isoformat') else str(window_from),
+                        'window_to': window_to.isoformat() if hasattr(window_to, 'isoformat') else str(window_to),
+                        'price_multiplier': float(getattr(self.config, 'price_multiplier', 0) or 0),
+                        'note': f'cmp={float(active_spot_ltp):.4f};source={"historical_underlying" if baseline_cmp is not None else "strike_universe_fallback"}'
+                    }
+                )
+
+                strikes_by_type = self._resolve_strikes_by_type(symbol, expiry, float(active_spot_ltp))
+                strikes_total += len(strikes_by_type.get('CE', [])) + len(strikes_by_type.get('PE', []))
+                for option_type in ('CE', 'PE'):
+                    for strike in strikes_by_type.get(option_type, []):
+                        if not self.is_running or self._stop_event.is_set():
+                            return symbol_detected, strikes_scanned, strikes_total, instruments_missing, candles_missing
+                        strikes_scanned += 1
+
+                        instrument = self.angel_api.lookup_option_instrument(
+                            underlying=symbol,
+                            expiry=expiry,
+                            strike=strike,
+                            option_type=option_type,
+                            exchange='NFO'
+                        )
+                        if not instrument:
+                            instruments_missing += 1
+                            self._write_backtest_scan_log(
+                                'skip_strike',
+                                {
+                                    'symbol': symbol,
+                                    'option_type': option_type,
+                                    'strike': float(strike),
+                                    'reason': 'instrument_not_found',
+                                    'expiry': expiry.isoformat() if hasattr(expiry, 'isoformat') else str(expiry),
+                                    'window_from': window_from.isoformat() if hasattr(window_from, 'isoformat') else str(window_from),
+                                    'window_to': window_to.isoformat() if hasattr(window_to, 'isoformat') else str(window_to)
+                                }
+                            )
+                            self._write_backtest_scan_csv(
+                                'skip_strike',
+                                {
+                                    'symbol': symbol,
+                                    'expiry': expiry.isoformat() if hasattr(expiry, 'isoformat') else str(expiry),
+                                    'window_from': window_from.isoformat() if hasattr(window_from, 'isoformat') else str(window_from),
+                                    'window_to': window_to.isoformat() if hasattr(window_to, 'isoformat') else str(window_to),
+                                    'option_type': option_type,
+                                    'strike': float(strike),
+                                    'skip_reason': 'instrument_not_found',
+                                    'price_multiplier': float(getattr(self.config, 'price_multiplier', 0) or 0),
+                                    'note': ''
+                                }
+                            )
+                            self._write_api_error_log(
+                                mode='backtest',
+                                event='option_instrument_missing',
+                                details={
+                                    'symbol': symbol,
+                                    'expiry': expiry.isoformat() if hasattr(expiry, 'isoformat') else str(expiry),
+                                    'option_type': option_type,
+                                    'strike': float(strike)
+                                }
+                            )
+                            continue
+
+                        self._write_backtest_scan_log(
+                            'scan_strike',
+                            {
+                                'symbol': symbol,
+                                'option_type': option_type,
+                                'strike': float(strike),
+                                'expiry': expiry.isoformat() if hasattr(expiry, 'isoformat') else str(expiry),
+                                'window_from': window_from.isoformat() if hasattr(window_from, 'isoformat') else str(window_from),
+                                'window_to': window_to.isoformat() if hasattr(window_to, 'isoformat') else str(window_to),
+                                'instrument_symbol': instrument.get('symbol'),
+                                'instrument_token': instrument.get('token')
+                            }
+                        )
+                        self._write_backtest_scan_csv(
+                            'scan_strike',
+                            {
+                                'symbol': symbol,
+                                'expiry': expiry.isoformat() if hasattr(expiry, 'isoformat') else str(expiry),
+                                'window_from': window_from.isoformat() if hasattr(window_from, 'isoformat') else str(window_from),
+                                'window_to': window_to.isoformat() if hasattr(window_to, 'isoformat') else str(window_to),
+                                'option_type': option_type,
+                                'strike': float(strike),
+                                'instrument_symbol': instrument.get('symbol'),
+                                'instrument_token': instrument.get('token'),
+                                'price_multiplier': float(getattr(self.config, 'price_multiplier', 0) or 0),
+                                'note': ''
+                            }
+                        )
+
+                        candles = self._get_historical_candles_cached(
+                            instrument=instrument,
+                            timeframe=timeframe,
+                            from_date=window_from,
+                            to_date=window_to,
+                            exchange='NFO'
+                        )
+                        if not candles or len(candles) < 2:
+                            candles = self._get_historical_candles_force_check(
+                                instrument=instrument,
+                                timeframe=timeframe,
+                                from_date=window_from,
+                                to_date=window_to,
+                                exchange='NFO'
+                            )
+                        min_candles_needed = max(2, self._backtest_min_candles_per_strike)
+                        if not candles or len(candles) < min_candles_needed:
+                            candles_missing += 1
+                            self._write_backtest_scan_log(
+                                'skip_strike',
+                                {
+                                    'symbol': symbol,
+                                    'option_type': option_type,
+                                    'strike': float(strike),
+                                    'instrument_symbol': instrument.get('symbol'),
+                                    'reason': 'insufficient_candles',
+                                    'candles_count': len(candles or []),
+                                    'min_required_candles': int(min_candles_needed)
+                                }
+                            )
+                            self._write_backtest_scan_csv(
+                                'skip_strike',
+                                {
+                                    'symbol': symbol,
+                                    'expiry': expiry.isoformat() if hasattr(expiry, 'isoformat') else str(expiry),
+                                    'window_from': window_from.isoformat() if hasattr(window_from, 'isoformat') else str(window_from),
+                                    'window_to': window_to.isoformat() if hasattr(window_to, 'isoformat') else str(window_to),
+                                    'option_type': option_type,
+                                    'strike': float(strike),
+                                    'instrument_symbol': instrument.get('symbol'),
+                                    'instrument_token': instrument.get('token'),
+                                    'candles_count': len(candles or []),
+                                    'min_required_candles': int(min_candles_needed),
+                                    'skip_reason': 'insufficient_candles',
+                                    'price_multiplier': float(getattr(self.config, 'price_multiplier', 0) or 0),
+                                    'note': ''
+                                }
+                            )
+                            self._write_api_error_log(
+                                mode='backtest',
+                                event='historical_candles_missing',
+                                details={
+                                    'symbol': symbol,
+                                    'instrument_symbol': instrument.get('symbol'),
+                                    'option_type': option_type,
+                                    'strike': float(strike),
+                                    'candles_count': len(candles or []),
+                                    'min_required_candles': int(min_candles_needed),
+                                    'api_last_error': getattr(self.angel_api, 'last_error', None)
+                                }
+                            )
+                            continue
+
+                        avg_volume = self._average_candle_volume(candles)
+                        self._write_backtest_scan_csv(
+                            'candles_loaded',
+                            {
+                                'symbol': symbol,
+                                'expiry': expiry.isoformat() if hasattr(expiry, 'isoformat') else str(expiry),
+                                'window_from': window_from.isoformat() if hasattr(window_from, 'isoformat') else str(window_from),
+                                'window_to': window_to.isoformat() if hasattr(window_to, 'isoformat') else str(window_to),
+                                'option_type': option_type,
+                                'strike': float(strike),
+                                'instrument_symbol': instrument.get('symbol'),
+                                'instrument_token': instrument.get('token'),
+                                'candles_count': len(candles or []),
+                                'min_required_candles': int(min_candles_needed),
+                                'avg_volume': round(avg_volume, 3),
+                                'min_avg_volume': int(self._backtest_min_avg_volume),
+                                'price_multiplier': float(getattr(self.config, 'price_multiplier', 0) or 0),
+                                'note': ''
+                            }
+                        )
+                        if self._backtest_liquidity_filter_enabled and avg_volume < float(self._backtest_min_avg_volume):
+                            self._write_backtest_scan_log(
+                                'skip_strike',
+                                {
+                                    'symbol': symbol,
+                                    'option_type': option_type,
+                                    'strike': float(strike),
+                                    'instrument_symbol': instrument.get('symbol'),
+                                    'reason': 'liquidity_filter',
+                                    'avg_volume': round(avg_volume, 3),
+                                    'min_avg_volume': int(self._backtest_min_avg_volume)
+                                }
+                            )
+                            self._write_backtest_scan_csv(
+                                'skip_strike',
+                                {
+                                    'symbol': symbol,
+                                    'expiry': expiry.isoformat() if hasattr(expiry, 'isoformat') else str(expiry),
+                                    'window_from': window_from.isoformat() if hasattr(window_from, 'isoformat') else str(window_from),
+                                    'window_to': window_to.isoformat() if hasattr(window_to, 'isoformat') else str(window_to),
+                                    'option_type': option_type,
+                                    'strike': float(strike),
+                                    'instrument_symbol': instrument.get('symbol'),
+                                    'instrument_token': instrument.get('token'),
+                                    'candles_count': len(candles or []),
+                                    'min_required_candles': int(min_candles_needed),
+                                    'avg_volume': round(avg_volume, 3),
+                                    'min_avg_volume': int(self._backtest_min_avg_volume),
+                                    'skip_reason': 'liquidity_filter',
+                                    'price_multiplier': float(getattr(self.config, 'price_multiplier', 0) or 0),
+                                    'note': ''
+                                }
+                            )
+                            continue
+
+                        for i in range(1, len(candles)):
+                            if not self.is_running or self._stop_event.is_set():
+                                return symbol_detected, strikes_scanned, strikes_total, instruments_missing, candles_missing
+                            prev_time = self._parse_candle_time(candles[i - 1][0])
+                            current_time = self._parse_candle_time(candles[i][0])
+                            if not prev_time or not current_time:
+                                continue
+                            previous_close = float(candles[i - 1][4])
+                            current_close = float(candles[i][4])
+                            rsi = self._calculate_rsi(candles[:i + 1], period=14)
+                            option_data = {
+                                'symbol': instrument['symbol'],
+                                'option_type': option_type,
+                                'strike_price': strike,
+                                'ltp': current_close,
+                                'previous_candle_close': previous_close,
+                                'candle_open': float(candles[i][1]) if len(candles[i]) > 1 else None,
+                                'candle_high': float(candles[i][2]) if len(candles[i]) > 2 else None,
+                                'candle_low': float(candles[i][3]) if len(candles[i]) > 3 else None,
+                                'candle_close': current_close,
+                                'volume': int(float(candles[i][5])) if len(candles[i]) > 5 else 0,
+                                'open_interest': 0,
+                                'rsi': rsi
+                            }
+                            signal = SignalDetector.detect_signal(option_data, self.config)
+                            threshold = float(previous_close) * float(getattr(self.config, 'price_multiplier', 0) or 0)
+                            change_percent = ((current_close - previous_close) / previous_close * 100.0) if previous_close else 0.0
+                            self._write_backtest_scan_log(
+                                'scan_candle',
+                                {
+                                    'symbol': symbol,
+                                    'instrument_symbol': instrument.get('symbol'),
+                                    'option_type': option_type,
+                                    'strike': float(strike),
+                                    'scan_time_utc': datetime.utcnow().isoformat() + 'Z',
+                                    'previous_candle_time': prev_time.isoformat() if prev_time else None,
+                                    'candle_time': current_time.isoformat() if current_time else None,
+                                    'ohlc': {
+                                        'open': option_data.get('candle_open'),
+                                        'high': option_data.get('candle_high'),
+                                        'low': option_data.get('candle_low'),
+                                        'close': option_data.get('candle_close')
+                                    },
+                                    'previous_close': previous_close,
+                                    'current_close': current_close,
+                                    'volume': option_data.get('volume'),
+                                    'rsi': rsi,
+                                    'signal_detected': bool(signal)
+                                }
+                            )
+                            self._write_backtest_scan_csv(
+                                'scan_candle',
+                                {
+                                    'symbol': symbol,
+                                    'expiry': expiry.isoformat() if hasattr(expiry, 'isoformat') else str(expiry),
+                                    'window_from': window_from.isoformat() if hasattr(window_from, 'isoformat') else str(window_from),
+                                    'window_to': window_to.isoformat() if hasattr(window_to, 'isoformat') else str(window_to),
+                                    'option_type': option_type,
+                                    'strike': float(strike),
+                                    'instrument_symbol': instrument.get('symbol'),
+                                    'instrument_token': instrument.get('token'),
+                                    'candles_count': len(candles or []),
+                                    'min_required_candles': int(min_candles_needed),
+                                    'avg_volume': round(avg_volume, 3),
+                                    'min_avg_volume': int(self._backtest_min_avg_volume),
+                                    'previous_candle_time': prev_time.isoformat() if prev_time else '',
+                                    'candle_time': current_time.isoformat() if current_time else '',
+                                    'candle_open': option_data.get('candle_open'),
+                                    'candle_high': option_data.get('candle_high'),
+                                    'candle_low': option_data.get('candle_low'),
+                                    'candle_close': option_data.get('candle_close'),
+                                    'previous_close': previous_close,
+                                    'current_close': current_close,
+                                    'price_multiplier': float(getattr(self.config, 'price_multiplier', 0) or 0),
+                                    'threshold_upper': threshold,
+                                    'change_percent': round(change_percent, 4),
+                                    'comparison': f'{current_close:.6f}>{threshold:.6f}',
+                                    'signal_detected': bool(signal),
+                                    'note': ''
+                                }
+                            )
+                            if not signal:
+                                continue
+                            signal['strike_price'] = self._normalize_signal_strike(
+                                signal.get('strike_price'),
+                                signal.get('symbol')
+                            )
+                            signal['expiry_date'] = expiry
+                            signal['detected_at'] = current_time
+                            signal['displayed_at'] = datetime.utcnow()
+                            signal['mode'] = 'backtest'
+                            symbol_detected.append(signal)
+
+        return symbol_detected, strikes_scanned, strikes_total, instruments_missing, candles_missing
+
+    def _get_historical_candles_force_check(self, instrument, timeframe, from_date, to_date, exchange='NFO'):
+        """Force re-check candles before marking a strike as skipped."""
+        symbol = instrument.get('symbol')
+        token = instrument.get('token')
+        windows = [
+            (from_date, to_date),
+            (from_date - timedelta(days=1), to_date),
+            (from_date - timedelta(days=3), to_date)
+        ]
+        best = []
+        for win_from, win_to in windows:
+            try:
+                candles = self._get_historical_candles_cached(
+                    instrument=instrument,
+                    timeframe=timeframe,
+                    from_date=win_from,
+                    to_date=win_to,
+                    exchange=exchange
+                ) or []
+                if len(candles) > len(best):
+                    best = candles
+                if len(candles) >= 2:
+                    return candles
+            except Exception:
+                continue
+        return best
+
+    def _get_historical_candles_cached(self, instrument, timeframe, from_date, to_date, exchange='NFO'):
+        symbol = instrument.get('symbol') if isinstance(instrument, dict) else None
+        token = instrument.get('token') if isinstance(instrument, dict) else None
+        key = (
+            str(symbol or ''),
+            str(token or ''),
+            str(exchange or ''),
+            int(timeframe),
+            from_date.strftime('%Y-%m-%d %H:%M'),
+            to_date.strftime('%Y-%m-%d %H:%M')
+        )
+        cached = self._historical_cache.get(key)
+        if cached is not None:
+            return list(cached)
+
+        candles = self.angel_api.get_historical_data(
+            symbol=symbol,
+            timeframe=timeframe,
+            from_date=from_date,
+            to_date=to_date,
+            exchange=exchange,
+            symbol_token=token
+        )
+        if candles:
+            self._historical_cache[key] = list(candles)
+            if self._historical_cache_max > 0 and len(self._historical_cache) > self._historical_cache_max:
+                self._historical_cache.popitem(last=False)
+        return candles
+
+    def _get_live_option_snapshot_force_check(self, symbol, expiry, strike, option_type, timeframe):
+        """Fallback snapshot construction when API snapshot call returns None."""
+        try:
+            instrument = self.angel_api.lookup_option_instrument(
+                underlying=symbol,
+                expiry=expiry,
+                strike=strike,
+                option_type=option_type,
+                exchange='NFO'
+            )
+            if not instrument:
+                return None
+            interval_minutes = max(1, self._safe_int(timeframe, 5))
+            to_date = datetime.now() - timedelta(minutes=interval_minutes)
+            from_date = to_date - timedelta(minutes=interval_minutes * 40)
+            candles = self.angel_api.get_historical_data(
+                symbol=instrument['symbol'],
+                timeframe=timeframe,
+                from_date=from_date,
+                to_date=to_date,
+                exchange='NFO',
+                symbol_token=instrument['token']
+            ) or []
+            if len(candles) < 2:
+                return None
+            prev = candles[-2]
+            curr = candles[-1]
+            prev_close = float(prev[4])
+            curr_close = float(curr[4])
+            curr_open = float(curr[1]) if len(curr) > 1 else None
+            curr_high = float(curr[2]) if len(curr) > 2 else None
+            curr_low = float(curr[3]) if len(curr) > 3 else None
+            volume = int(float(curr[5])) if len(curr) > 5 else 0
+            rsi = self._calculate_rsi(candles, period=14)
+            ts = self._parse_candle_time(curr[0]) if len(curr) > 0 else None
+            return {
+                'symbol': instrument['symbol'],
+                'option_type': option_type,
+                'strike_price': strike,
+                'previous_candle_close': prev_close,
+                'current_candle_open': curr_open,
+                'current_candle_high': curr_high,
+                'current_candle_low': curr_low,
+                'current_candle_close': curr_close,
+                'volume': volume,
+                'open_interest': 0,
+                'rsi': rsi,
+                'candle_time': ts
+            }
+        except Exception:
+            return None
+
+    def _open_backtest_scan_log(self, from_date, to_date, timeframe, stocks):
+        if not self._backtest_scan_log_enabled:
+            return
+        try:
+            os.makedirs('logs', exist_ok=True)
+            stamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+            file_name = f'backtest_scan_user_{self.user_id}_{stamp}.log'
+            self._backtest_log_path = os.path.join('logs', file_name)
+            self._backtest_log_handle = open(self._backtest_log_path, 'a', encoding='utf-8')
+            csv_file_name = f'backtest_scan_user_{self.user_id}_{stamp}.csv'
+            self._backtest_csv_path = os.path.join('logs', csv_file_name)
+            self._backtest_csv_handle = open(self._backtest_csv_path, 'w', newline='', encoding='utf-8')
+            self._backtest_csv_writer = csv.DictWriter(
+                self._backtest_csv_handle,
+                fieldnames=self._backtest_csv_fields()
+            )
+            self._backtest_csv_writer.writeheader()
+            self._backtest_csv_handle.flush()
+            self._write_backtest_scan_log(
+                'backtest_start',
+                {
+                    'user_id': self.user_id,
+                    'config_id': self.config_id,
+                    'from_date': str(from_date),
+                    'to_date': str(to_date),
+                    'timeframe': timeframe,
+                    'workers': self.max_workers,
+                    'rebalance_frequency': self._backtest_rebalance_frequency,
+                    'strict_first_candle': bool(self._backtest_strict_first_candle),
+                    'liquidity_filter_enabled': bool(self._backtest_liquidity_filter_enabled),
+                    'min_candles_per_strike': int(self._backtest_min_candles_per_strike),
+                    'min_avg_volume': int(self._backtest_min_avg_volume),
+                    'stocks_total': len(stocks or []),
+                    'stocks': list(stocks or []),
+                    'csv_file': self._backtest_csv_path
+                }
+            )
+            self._write_backtest_scan_csv(
+                'backtest_start',
+                {
+                    'symbol': '',
+                    'expiry': '',
+                    'window_from': str(from_date),
+                    'window_to': str(to_date),
+                    'option_type': '',
+                    'strike': '',
+                    'instrument_symbol': '',
+                    'instrument_token': '',
+                    'candles_count': '',
+                    'min_required_candles': int(self._backtest_min_candles_per_strike),
+                    'avg_volume': '',
+                    'min_avg_volume': int(self._backtest_min_avg_volume),
+                    'price_multiplier': float(getattr(self.config, 'price_multiplier', 0) or 0),
+                    'comparison': '',
+                    'signal_detected': '',
+                    'skip_reason': '',
+                    'note': (
+                        f'workers={self.max_workers}, frequency={self._backtest_rebalance_frequency}, '
+                        f'strict_first_candle={bool(self._backtest_strict_first_candle)}, '
+                        f'liquidity_filter={bool(self._backtest_liquidity_filter_enabled)}'
+                    )
+                }
+            )
+        except Exception as e:
+            logger.error('Failed to open backtest scan log: %s', str(e))
+            self._backtest_log_handle = None
+            self._backtest_log_path = None
+            self._backtest_csv_handle = None
+            self._backtest_csv_writer = None
+            self._backtest_csv_path = None
+
+    def _write_api_error_log(self, mode, event, details=None):
+        if not self._api_error_log_enabled:
+            return
+        try:
+            os.makedirs('logs', exist_ok=True)
+            stamp = datetime.utcnow().strftime('%Y%m%d')
+            file_path = os.path.join('logs', f'api_error_user_{self.user_id}_{stamp}.log')
+            row = {
+                'logged_at_utc': datetime.utcnow().isoformat() + 'Z',
+                'mode': str(mode or ''),
+                'event': str(event or ''),
+                'details': details or {}
+            }
+            line = json.dumps(row, ensure_ascii=True) + '\n'
+            with self._api_error_log_lock:
+                with open(file_path, 'a', encoding='utf-8') as handle:
+                    handle.write(line)
+        except Exception:
+            pass
+
+    def _write_backtest_scan_log(self, event, payload):
+        if not self._backtest_scan_log_enabled or not self._backtest_log_handle:
+            return
+        row = {
+            'event': str(event),
+            'logged_at_utc': datetime.utcnow().isoformat() + 'Z',
+            'data': payload or {}
+        }
+        try:
+            line = json.dumps(row, ensure_ascii=True) + '\n'
+            with self._backtest_log_lock:
+                self._backtest_log_handle.write(line)
+                self._backtest_log_handle.flush()
+        except Exception as e:
+            logger.error('Failed to write backtest scan log: %s', str(e))
+
+    def _backtest_csv_fields(self):
+        return [
+            'logged_at_utc',
+            'event',
+            'symbol',
+            'expiry',
+            'window_from',
+            'window_to',
+            'option_type',
+            'strike',
+            'instrument_symbol',
+            'instrument_token',
+            'candles_count',
+            'min_required_candles',
+            'avg_volume',
+            'min_avg_volume',
+            'previous_candle_time',
+            'candle_time',
+            'candle_open',
+            'candle_high',
+            'candle_low',
+            'candle_close',
+            'previous_close',
+            'current_close',
+            'price_multiplier',
+            'threshold_upper',
+            'change_percent',
+            'comparison',
+            'signal_detected',
+            'skip_reason',
+            'note'
+        ]
+
+    def _write_backtest_scan_csv(self, event, payload):
+        if not self._backtest_scan_log_enabled or not self._backtest_csv_writer or not self._backtest_csv_handle:
+            return
+        source = payload or {}
+        row = {key: '' for key in self._backtest_csv_fields()}
+        row['logged_at_utc'] = datetime.utcnow().isoformat() + 'Z'
+        row['event'] = str(event or '')
+        for key in row.keys():
+            if key in ('logged_at_utc', 'event'):
+                continue
+            value = source.get(key, '')
+            if isinstance(value, bool):
+                row[key] = '1' if value else '0'
+            else:
+                row[key] = value
+        try:
+            with self._backtest_log_lock:
+                self._backtest_csv_writer.writerow(row)
+                self._backtest_csv_handle.flush()
+        except Exception as e:
+            logger.error('Failed to write backtest CSV log: %s', str(e))
+
+    def _close_backtest_scan_log(self, summary=None):
+        json_handle = self._backtest_log_handle
+        csv_handle = self._backtest_csv_handle
+        if not json_handle and not csv_handle:
+            return
+        try:
+            self._write_backtest_scan_log(
+                'backtest_end',
+                {
+                    'summary': summary or {},
+                    'log_file': self._backtest_log_path,
+                    'csv_file': self._backtest_csv_path
+                }
+            )
+            self._write_backtest_scan_csv(
+                'backtest_end',
+                {
+                    'note': json.dumps(summary or {}, ensure_ascii=True)
+                }
+            )
+        finally:
+            try:
+                with self._backtest_log_lock:
+                    if json_handle:
+                        json_handle.close()
+                    if csv_handle:
+                        csv_handle.close()
+            except Exception:
+                pass
+            self._backtest_log_handle = None
+            self._backtest_csv_handle = None
+            self._backtest_csv_writer = None
 
     def get_selected_expiries(self, reference_date=None):
         """Return selected expiry per symbol for current config."""
@@ -463,6 +1253,189 @@ class ScannerEngine:
             expiry = self._resolve_expiry(symbol, reference_date=ref)
             selected[symbol] = expiry.isoformat() if expiry else None
         return selected
+
+    def _last_thursday_of_month(self, year, month):
+        if month == 12:
+            next_month = date(year + 1, 1, 1)
+        else:
+            next_month = date(year, month + 1, 1)
+        last_day = next_month - timedelta(days=1)
+        while last_day.weekday() != 3:
+            last_day -= timedelta(days=1)
+        return last_day
+
+    def _next_calendar_expiry(self, symbol, reference_date):
+        ref_date = reference_date.date() if isinstance(reference_date, datetime) else reference_date
+        expiry_type = DataProcessor.get_expiry_type(symbol)
+        if expiry_type == 'weekly':
+            days_ahead = 3 - ref_date.weekday()
+            if days_ahead < 0:
+                days_ahead += 7
+            return ref_date + timedelta(days=days_ahead)
+
+        # Monthly: last Thursday of current month; if already passed, roll to next month.
+        monthly = self._last_thursday_of_month(ref_date.year, ref_date.month)
+        if monthly >= ref_date:
+            return monthly
+        if ref_date.month == 12:
+            return self._last_thursday_of_month(ref_date.year + 1, 1)
+        return self._last_thursday_of_month(ref_date.year, ref_date.month + 1)
+
+    def _resolve_backtest_expiry(self, symbol, reference_date):
+        """
+        Resolve expiry for backtest with rolling semantics.
+        Prefers scrip-master expiry near calendar expiry (holiday-shift tolerant),
+        otherwise falls back to strict calendar next expiry (never far-future jump).
+        """
+        ref_date = reference_date.date() if isinstance(reference_date, datetime) else reference_date
+        if not isinstance(ref_date, date):
+            return None
+
+        calendar_expiry = self._next_calendar_expiry(symbol, ref_date)
+        expiry_type = DataProcessor.get_expiry_type(symbol)
+        tolerance_days = 10 if expiry_type == 'monthly' else 3
+
+        available = []
+        try:
+            available = self.angel_api.get_available_option_expiries(symbol, exchange='NFO') or []
+        except Exception:
+            available = []
+
+        if available:
+            candidates = [e for e in available if e >= ref_date]
+            if candidates:
+                for candidate in candidates:
+                    if calendar_expiry and abs((candidate - calendar_expiry).days) <= tolerance_days:
+                        return candidate
+                # If no candidate aligns with expected cycle, avoid wrong far-future contract.
+                return calendar_expiry
+
+        return calendar_expiry
+
+    def _build_backtest_expiry_segments(self, symbol, from_date, to_date):
+        """
+        Build rolling expiry segments across the backtest window.
+        Each segment scans candles only until its expiry date, then rolls.
+        """
+        start_dt = from_date if isinstance(from_date, datetime) else datetime.combine(from_date, datetime.min.time())
+        end_dt = to_date if isinstance(to_date, datetime) else datetime.combine(to_date, datetime.max.time())
+        cursor = start_dt.date()
+        end_date = end_dt.date()
+        segments = []
+        guard = 0
+
+        while cursor <= end_date and guard < 500:
+            guard += 1
+            expiry = self._resolve_backtest_expiry(symbol, cursor)
+            if not expiry or expiry < cursor:
+                break
+
+            seg_start = start_dt if cursor == start_dt.date() else datetime.combine(cursor, datetime.min.time())
+            seg_end_date = min(end_date, expiry)
+            seg_end = end_dt if seg_end_date == end_date else datetime.combine(seg_end_date, datetime.max.time())
+            if seg_end < seg_start:
+                break
+
+            segments.append((seg_start, seg_end, expiry))
+            cursor = seg_end_date + timedelta(days=1)
+
+        return segments
+
+    def _build_backtest_rebalance_windows(self, start_dt, end_dt, frequency=None):
+        freq = str(frequency or self._backtest_rebalance_frequency or 'weekly').strip().lower()
+        if freq not in ('daily', 'weekly', 'monthly'):
+            freq = 'weekly'
+        windows = []
+        cursor = start_dt
+        guard = 0
+        while cursor <= end_dt and guard < 500:
+            guard += 1
+            if freq == 'daily':
+                period_end = datetime.combine(cursor.date(), datetime.max.time())
+            elif freq == 'monthly':
+                if cursor.month == 12:
+                    next_month = date(cursor.year + 1, 1, 1)
+                else:
+                    next_month = date(cursor.year, cursor.month + 1, 1)
+                month_end = next_month - timedelta(days=1)
+                period_end = datetime.combine(month_end, datetime.max.time())
+            else:
+                week_end = cursor.date() + timedelta(days=(6 - cursor.weekday()))
+                period_end = datetime.combine(week_end, datetime.max.time())
+
+            if period_end > end_dt:
+                period_end = end_dt
+            windows.append((cursor, period_end))
+            cursor = period_end + timedelta(seconds=1)
+        return windows
+
+    def _resolve_backtest_cmp_schedule(self, symbol, start_dt, end_dt, base_timeframe):
+        """
+        Resolve baseline CMP values from historical underlying candles (NSE).
+        Returns list of tuples: (window_start_dt, window_end_dt, cmp_value_or_none).
+        """
+        windows = self._build_backtest_rebalance_windows(start_dt, end_dt)
+        if not windows:
+            return []
+
+        cmp_timeframe = max(15, min(60, self._safe_int(base_timeframe, 5)))
+        candles = []
+        try:
+            candles = self.angel_api.get_historical_data(
+                symbol=symbol,
+                timeframe=cmp_timeframe,
+                from_date=start_dt,
+                to_date=end_dt,
+                exchange='NSE'
+            ) or []
+        except Exception:
+            candles = []
+
+        parsed = []
+        for row in candles:
+            try:
+                ts = self._parse_candle_time(row[0]) if len(row) > 0 else None
+                if ts and ts.tzinfo is not None:
+                    ts = ts.astimezone(timezone.utc).replace(tzinfo=None)
+                close_val = float(row[4]) if len(row) > 4 else None
+                if ts and close_val is not None:
+                    parsed.append((ts, close_val))
+            except Exception:
+                continue
+        parsed.sort(key=lambda item: item[0])
+
+        schedule = []
+        for window_start, window_end in windows:
+            baseline_cmp = None
+            if self._backtest_strict_first_candle:
+                for ts, close_val in parsed:
+                    if ts < window_start:
+                        continue
+                    if ts > window_end:
+                        break
+                    baseline_cmp = close_val
+                    break
+            else:
+                prior_close = None
+                first_inside_close = None
+                for ts, close_val in parsed:
+                    if ts <= window_start:
+                        prior_close = close_val
+                        continue
+                    if ts > window_end:
+                        break
+                    if first_inside_close is None:
+                        first_inside_close = close_val
+                baseline_cmp = prior_close if prior_close is not None else first_inside_close
+
+            schedule.append((window_start, window_end, baseline_cmp))
+        return schedule
+
+    def _build_weekly_windows(self, start_dt, end_dt):
+        return self._build_backtest_rebalance_windows(start_dt, end_dt, frequency='weekly')
+
+    def _resolve_backtest_weekly_cmp_schedule(self, symbol, start_dt, end_dt, base_timeframe):
+        return self._resolve_backtest_cmp_schedule(symbol, start_dt, end_dt, base_timeframe)
 
     def _resolve_expiry(self, symbol, reference_date=None):
         """
@@ -682,6 +1655,20 @@ class ScannerEngine:
         except Exception:
             return None
 
+    def _average_candle_volume(self, candles):
+        if not candles:
+            return 0.0
+        volumes = []
+        for row in candles:
+            try:
+                if len(row) > 5:
+                    volumes.append(float(row[5] or 0))
+            except Exception:
+                continue
+        if not volumes:
+            return 0.0
+        return float(sum(volumes) / len(volumes))
+
     def _resolve_strikes(self, symbol, expiry, spot_price):
         """
         Resolve strike list from scrip master first (most accurate), fallback to step-based.
@@ -742,7 +1729,7 @@ class ScannerEngine:
                 atm_strike + (idx * float(strike_step))
                 for idx in range(-fallback_span, fallback_span + 1)
             ]
-        normalized_candidates = self._normalize_strike_candidates_for_spot(spot_price, candidates)
+        normalized_candidates = self._normalize_strike_candidates_for_spot(spot_price, candidates, symbol=symbol)
         return self._split_strikes_for_option_types(spot_price, normalized_candidates, strike_count)
 
     def _safe_int(self, value, default=0):
@@ -759,11 +1746,10 @@ class ScannerEngine:
 
     def _effective_strike_range(self):
         configured = self._safe_int(getattr(self.config, 'strike_range', 0), 0)
-        if configured > 0:
+        if configured >= 0:
             return configured
-        # Live mode defaults to tighter strike range for faster cycles.
-        config_name = str(getattr(self.config, 'config_name', '') or '').lower()
-        return 2 if config_name.startswith('live ') else 5
+        # Fallback for malformed values.
+        return 0
 
     def _refresh_daily_caches(self, reference_time=None):
         ref = reference_time or datetime.now()
@@ -790,11 +1776,15 @@ class ScannerEngine:
             return list(stocks)
 
         ranked = []
+        skipped_by_cmp = 0
         for symbol in stocks:
             quote = quotes.get(symbol)
             if not quote:
                 continue
             ltp = float(quote.get('ltp') or 0)
+            if ltp < self._cmp_min or ltp > self._cmp_max:
+                skipped_by_cmp += 1
+                continue
             close = float(quote.get('close') or 0)
             volume = self._safe_int(quote.get('volume', 0), 0)
             move_pct = abs(((ltp - close) / close) * 100.0) if close else 0.0
@@ -846,7 +1836,30 @@ class ScannerEngine:
             len(selected),
             len(stocks)
         )
+        if skipped_by_cmp:
+            logger.info(
+                'Live prefilter skipped %s stocks due to CMP outside range [%s, %s].',
+                skipped_by_cmp,
+                int(self._cmp_min),
+                int(self._cmp_max)
+            )
         return selected
+
+    def _log_api_activity(self, mode):
+        now = time.time()
+        if (now - self._last_api_stats_log_at) < 30:
+            return
+        self._last_api_stats_log_at = now
+        try:
+            stats = self.angel_api.get_rate_limit_stats(window_seconds=60, clear=True)
+            logger.info(
+                'API activity (%s): requests/min=%s rate_limit_hits/min=%s',
+                mode,
+                stats.get('requests', 0),
+                stats.get('rate_limit_hits', 0)
+            )
+        except Exception:
+            pass
 
     def _claim_live_candle_slot(self, timeframe_minutes):
         now = datetime.now()
@@ -868,9 +1881,9 @@ class ScannerEngine:
         if not strikes:
             return []
         strike_count = self._safe_int(strike_range, 0)
-        if strike_count <= 0:
-            return []
         sorted_strikes = sorted(float(s) for s in strikes)
+        if strike_count <= 0:
+            return sorted_strikes
         try:
             spot_val = float(spot_price or 0)
         except Exception:
@@ -885,7 +1898,7 @@ class ScannerEngine:
 
     def _split_strikes_for_option_types(self, spot_price, strikes, strike_count):
         normalized = sorted(set(float(s) for s in (strikes or [])))
-        count = max(1, self._safe_int(strike_count, 0))
+        count = self._safe_int(strike_count, 0)
         if not normalized:
             return {'CE': [], 'PE': []}
 
@@ -900,12 +1913,17 @@ class ScannerEngine:
             pe_ordered = sorted(normalized, key=lambda s: (abs(s - spot), -s))
         if not ce_ordered:
             ce_ordered = sorted(normalized, key=lambda s: (abs(s - spot), s))
+        if count <= 0:
+            return {
+                'PE': pe_ordered,
+                'CE': ce_ordered
+            }
         return {
             'PE': pe_ordered[:count],
             'CE': ce_ordered[:count]
         }
 
-    def _normalize_strike_candidates_for_spot(self, spot_price, strikes):
+    def _normalize_strike_candidates_for_spot(self, spot_price, strikes, symbol=None):
         """
         Normalize strike scales against spot.
         Handles master files that store strikes as 100x values (e.g. 10600 vs 106).
@@ -920,7 +1938,7 @@ class ScannerEngine:
         if not raw:
             return []
         if spot <= 0:
-            return sorted(set(raw))
+            return self._normalize_strike_candidates_without_spot(raw, symbol=symbol)
 
         best_scaled = raw
         best_score = float('inf')
@@ -936,6 +1954,53 @@ class ScannerEngine:
                 best_scaled = scaled
 
         return sorted(set(round(s, 2) for s in best_scaled))
+
+    def _normalize_strike_candidates_without_spot(self, strikes, symbol=None):
+        if not strikes:
+            return []
+        raw = [float(s) for s in strikes if s is not None]
+        if not raw:
+            return []
+
+        step = float(self._strike_step(symbol or 'NIFTY'))
+        best_scaled = raw
+        best_score = float('inf')
+        for factor in (1.0, 0.01, 0.1, 10.0, 100.0):
+            scaled = [round(s * factor, 4) for s in raw]
+            if not scaled:
+                continue
+            positive = [s for s in scaled if s > 0]
+            if not positive:
+                continue
+            median = sorted(positive)[len(positive) // 2]
+            grid_errors = [abs((s / step) - round(s / step)) for s in positive[: min(len(positive), 200)]]
+            grid_score = (sum(grid_errors) / len(grid_errors)) if grid_errors else 0.0
+            range_penalty = 0.0 if (step <= median <= 200000.0) else 5.0
+            score = grid_score + range_penalty
+            if score < best_score:
+                best_score = score
+                best_scaled = scaled
+
+        return sorted(set(round(s, 2) for s in best_scaled if s > 0))
+
+    def _infer_spot_from_strike_universe(self, symbol, expiry):
+        try:
+            expiry_date = expiry if not isinstance(expiry, datetime) else expiry.date()
+            strikes = self.angel_api.get_option_strikes_for_expiry(
+                underlying=symbol,
+                expiry=expiry_date,
+                exchange='NFO'
+            ) or []
+            normalized = self._normalize_strike_candidates_for_spot(0, strikes, symbol=symbol)
+            if not normalized:
+                return None
+            ordered = sorted(normalized)
+            mid = len(ordered) // 2
+            if len(ordered) % 2 == 0 and mid > 0:
+                return float((ordered[mid - 1] + ordered[mid]) / 2.0)
+            return float(ordered[mid])
+        except Exception:
+            return None
 
     def _signal_details_table_exists(self):
         if self._has_signal_details_table is not None:

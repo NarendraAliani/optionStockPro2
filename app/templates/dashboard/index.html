@@ -131,6 +131,7 @@
             <div class="mini-stat"><span>Last run:</span> <span class="text-small" id="liveLastRun">--</span></div>
             <div class="mini-stat"><span>Scripts scanned:</span> <span id="liveScriptsScanned">0</span></div>
             <div class="mini-stat"><span>Strikes scanned:</span> <span id="liveStrikesScanned">0</span></div>
+            <div class="mini-stat"><span>Skip Candles:</span> <span id="liveSkippedCandles">0</span></div>
             <div class="mini-stat"><span>Workers:</span> <span id="liveWorkers">--</span></div>
             <div class="mini-stat"><span>Generated:</span> <span id="liveSignalsGenerated">0</span></div>
             <div class="mini-stat"><span>Note:</span> <span class="text-small" id="liveProcessNote">Scanner is idle.</span></div>
@@ -148,6 +149,8 @@
             <div class="mini-stat"><span>Finished:</span> <span class="text-small" id="backtestFinishedAt">--</span></div>
             <div class="mini-stat"><span>Signals:</span> <span id="backtestSignalsGenerated">0</span></div>
             <div class="mini-stat"><span>Scripts scanned:</span> <span id="backtestScriptsScanned">0</span></div>
+            <div class="mini-stat"><span>Strikes scanned:</span> <span id="backtestStrikesScanned">0</span></div>
+            <div class="mini-stat"><span>Skip Candles:</span> <span id="backtestSkippedCandles">0</span></div>
             <div class="mini-stat"><span>Workers:</span> <span id="backtestWorkers">--</span></div>
             <div class="mini-stat"><span>Note:</span> <span class="text-small" id="backtestProcessNote">Backtest is idle.</span></div>
             <div class="mini-stat"><span>Error:</span> <span class="text-small text-danger" id="backtestLastError" style="display:none;"></span></div>
@@ -175,6 +178,15 @@
                 </button>
                 <button class="btn-control btn-export" id="btnExportCsv" type="button">
                     <i class="fas fa-download"></i> Export CSV
+                </button>
+                <button class="btn-control" id="btnDownloadBacktestLog" type="button" title="Download latest backtest scan log" disabled>
+                    <i class="fas fa-file-download"></i> Download Latest Log
+                </button>
+                <button class="btn-control" id="btnDownloadBacktestCsv" type="button" title="Download latest backtest diagnostic CSV log" disabled>
+                    <i class="fas fa-file-csv"></i> Download Latest CSV Log
+                </button>
+                <button class="btn-control" id="btnDownloadErrorLog" type="button" title="Download latest API error log">
+                    <i class="fas fa-bug"></i> Download Latest Error Log
                 </button>
                 <button class="btn-control" id="btnBackfillOhlc" type="button" title="Fill missing OHLC for existing signals">
                     <i class="fas fa-database"></i> Backfill OHLC
@@ -349,7 +361,7 @@
     const SIGNAL_ALERT_COOLDOWN_MS = 2500;
     let scannerConfig = {
         stockSelection: 'all',
-        strikeRange: 5,
+        strikeRange: 0,
         priceMultiplier: 2,
         timeframe: 5,
         refreshInterval: 5,
@@ -364,8 +376,6 @@
     let signalSoundDataUrl = '';
     let liveScannerRunning = false;
     let backtestRunning = false;
-    let lastLiveRowsFingerprint = '';
-    let liveRowsBaselineReady = false;
     let countsBaselineReady = false;
     let previousSignalCounts = { live: 0, backtest: 0, total: 0 };
     let lastSignalAlertAt = 0;
@@ -378,7 +388,10 @@
     let backtestAuthReady = false;
     let backtestObservedScanned = 0;
     let backtestObservedTotal = 0;
+    let backtestObservedStrikesScanned = 0;
+    let backtestObservedStrikesTotal = 0;
     let backtestObservedSignals = 0;
+    let lastBacktestOutcomeToken = '';
     let unseenSignalCount = 0;
     let titleFlashTimer = null;
     let titleFlashOn = false;
@@ -440,6 +453,15 @@
         $('#btnExportCsv').on('click', function() {
             exportSignalsCsv();
         });
+        $('#btnDownloadBacktestLog').on('click', function() {
+            downloadLatestBacktestLog();
+        });
+        $('#btnDownloadBacktestCsv').on('click', function() {
+            downloadLatestBacktestCsv();
+        });
+        $('#btnDownloadErrorLog').on('click', function() {
+            downloadLatestErrorLog();
+        });
         $('#btnBackfillOhlc').on('click', function() {
             triggerManualOhlcBackfill();
         });
@@ -499,7 +521,6 @@
                 if (mode === 'backtest' && !backtestRunning && !backtestStartPending) return;
 
                 lastRealtimeSignalAt = Date.now();
-                playSignalAlert();
                 triggerSignalAttention(mode, payload, 1);
                 addSignalRowRealtime(mode, payload);
                 refreshSignalCounts();
@@ -508,16 +529,24 @@
                 const payload = progress || {};
                 const scanned = Number(payload.scripts_scanned || 0);
                 const total = Number(payload.scripts_total || 0);
+                const strikesScanned = Number(payload.strikes_scanned || 0);
+                const strikesTotal = Number(payload.strikes_total || 0);
                 const signals = Number(payload.signals || 0);
 
                 backtestObservedScanned = Math.max(backtestObservedScanned, isFinite(scanned) ? scanned : 0);
                 backtestObservedTotal = Math.max(backtestObservedTotal, isFinite(total) ? total : 0);
+                backtestObservedStrikesScanned = Math.max(backtestObservedStrikesScanned, isFinite(strikesScanned) ? strikesScanned : 0);
+                backtestObservedStrikesTotal = Math.max(backtestObservedStrikesTotal, isFinite(strikesTotal) ? strikesTotal : 0);
                 backtestObservedSignals = Math.max(backtestObservedSignals, isFinite(signals) ? signals : 0);
 
                 const scannedDisplay = backtestObservedTotal > 0
                     ? (backtestObservedScanned + ' / ' + backtestObservedTotal)
                     : String(backtestObservedScanned);
+                const strikesDisplay = backtestObservedStrikesTotal > 0
+                    ? (backtestObservedStrikesScanned + ' / ' + backtestObservedStrikesTotal)
+                    : String(backtestObservedStrikesScanned);
                 $('#backtestScriptsScanned').text(scannedDisplay);
+                $('#backtestStrikesScanned').text(strikesDisplay);
                 $('#backtestSignalsGenerated').text(backtestObservedSignals);
             });
             socketClient.on('live_progress', function(progress) {
@@ -527,8 +556,10 @@
                 const total = Number(payload.stocks_total || 0);
                 const strikesScanned = Number(payload.strikes_scanned || 0);
                 const strikesTotal = Number(payload.strikes_total || 0);
+                const skippedCandles = Number(payload.skipped_candles || 0);
                 $('#liveScriptsScanned').text(total > 0 ? (scanned + ' / ' + total) : String(scanned));
                 $('#liveStrikesScanned').text(strikesTotal > 0 ? (strikesScanned + ' / ' + strikesTotal) : String(strikesScanned));
+                $('#liveSkippedCandles').text(String(skippedCandles));
             });
         } catch (e) {
             // Keep polling path active if socket fails.
@@ -717,23 +748,11 @@
 
     function triggerSignalAttention(mode, signal, count) {
         const increment = Math.max(1, Number(count || 1));
+        playSignalAlert();
         unseenSignalCount += increment;
         pulseSignalsCard();
         showSignalToast(mode, signal || {}, increment);
         startTitleFlash();
-    }
-
-    function buildLiveSignalsFingerprint(signals) {
-        const payload = (signals || []).slice(0, 30).map(function(signal) {
-            return [
-                signal.id,
-                signal.detected_at || '',
-                signal.current_price || '',
-                signal.price_change_percent || '',
-                signal.volume || ''
-            ].join('|');
-        });
-        return payload.join('||');
     }
 
     function openLiveModal() {
@@ -815,7 +834,6 @@
         config.guardrailEnabled = scannerConfig.guardrailEnabled !== false;
         config.guardrailLoadThreshold = Number(scannerConfig.guardrailLoadThreshold || 1200);
         config.scanProfile = scannerConfig.scanProfile || 'balanced';
-        config.liveWorkersCap = Number(scannerConfig.liveWorkersCap || scannerConfig.workers || 8);
 
         const liveEstimate = estimateLoadUnits(config, 'live');
         if (config.guardrailEnabled && liveEstimate > Number(config.guardrailLoadThreshold || 1200)) {
@@ -1063,7 +1081,6 @@
         config.guardrailEnabled = scannerConfig.guardrailEnabled !== false;
         config.guardrailLoadThreshold = Number(scannerConfig.guardrailLoadThreshold || 1200);
         config.scanProfile = scannerConfig.scanProfile || 'balanced';
-        config.backtestWorkersCap = Number(scannerConfig.backtestWorkersCap || scannerConfig.workers || 8);
         const backtestEstimate = estimateLoadUnits(config, 'backtest', startDate, endDate);
         if (config.guardrailEnabled && backtestEstimate > Number(config.guardrailLoadThreshold || 1200)) {
             const proceed = confirm(
@@ -1076,7 +1093,10 @@
         }
         backtestObservedScanned = 0;
         backtestObservedTotal = 0;
+        backtestObservedStrikesScanned = 0;
+        backtestObservedStrikesTotal = 0;
         backtestObservedSignals = 0;
+        lastBacktestOutcomeToken = '';
 
         const btn = $('#btnRunBacktest');
         const originalText = btn.html();
@@ -1118,6 +1138,9 @@
                         signals: latestSignalCounts.backtest || 0,
                         scripts_scanned: 0,
                         scripts_total: 0,
+                        strikes_scanned: 0,
+                        strikes_total: 0,
+                        run_outcome: 'running',
                         last_error: null
                     });
                     const modalEl = document.getElementById('backtestModal');
@@ -1189,7 +1212,6 @@
                 const recentRealtimeSignal = (now - lastRealtimeSignalAt) < 3000;
 
                 if (countsBaselineReady && liveScannerRunning && liveDelta > 0) {
-                    playSignalAlert();
                     if (!recentRealtimeSignal) {
                         triggerSignalAttention('live', {}, liveDelta);
                     }
@@ -1282,13 +1304,16 @@
         }
         const text = 'Stock: ' + stockLabel +
             ', Timeframe: ' + scannerConfig.timeframe + 'm' +
-            ', Strike Range: ' + scannerConfig.strikeRange +
+            ', Strike Range: ' + (Number(scannerConfig.strikeRange || 0) <= 0 ? 'All' : scannerConfig.strikeRange) +
             ', Multiplier: ' + scannerConfig.priceMultiplier +
             ', Refresh: ' + scannerConfig.refreshInterval + 'm' +
             ', Workers Cap: ' + Number(scannerConfig.workers || 8) +
             ', Profile: ' + String(scannerConfig.scanProfile || 'balanced') +
             ', Auto Tune: ' + (scannerConfig.autoTune === false ? 'Off' : 'On') +
-            ', Live Pre-filter: ' + (scannerConfig.livePrefilterEnabled === false ? 'Off' : 'On');
+            ', Live Pre-filter: ' + (scannerConfig.livePrefilterEnabled === false ? 'Off' : 'On') +
+            ', Rebalance: ' + String(scannerConfig.backtestRebalanceFrequency || 'weekly') +
+            ', Strict Baseline: ' + (scannerConfig.backtestStrictFirstCandle === false ? 'Off' : 'On') +
+            ', Liquidity Filter: ' + (scannerConfig.backtestLiquidityFilterEnabled === false ? 'Off' : 'On');
         $('#configSummaryText').text(text);
         $('#liveConfigSummary').text(text);
         $('#backtestConfigSummary').text(text);
@@ -1306,7 +1331,8 @@
 
     function estimateLoadUnits(config, mode, startDate, endDate) {
         const stocks = estimateStockUniverse(config || {});
-        const strikeRange = Math.max(1, Number((config || {}).strikeRange || 5));
+        const strikeRaw = Number((config || {}).strikeRange ?? 0);
+        const strikeRange = strikeRaw <= 0 ? 20 : Math.max(1, strikeRaw);
         const timeframe = Math.max(1, Number((config || {}).timeframe || 5));
         let days = 1;
         if (mode === 'backtest' && startDate && endDate) {
@@ -1363,8 +1389,11 @@
             btBody.html('<tr><td colspan="6" class="text-muted">No backtest run data yet.</td></tr>');
         } else {
             const html = btRows.slice(0, 10).map(function(row) {
-                const status = row.error ? 'Error' : (row.stopped_by_user ? 'Stopped' : 'Done');
-                const statusClass = row.error ? 'is-error' : (row.stopped_by_user ? 'is-stopped' : 'is-done');
+                const outcome = String(row.outcome || '').toLowerCase();
+                const status = row.error ? 'Error' : (outcome === 'failed' ? 'Error' : (outcome === 'stopped' || row.stopped_by_user ? 'Stopped' : 'Done'));
+                const statusClass = row.error || outcome === 'failed'
+                    ? 'is-error'
+                    : ((outcome === 'stopped' || row.stopped_by_user) ? 'is-stopped' : 'is-done');
                 return '<tr>' +
                     '<td>' + formatTime(row.finished_at || row.completed_at) + '</td>' +
                     '<td>' + formatDuration(row.duration_ms) + '</td>' +
@@ -1398,15 +1427,6 @@
                     const table = targetMode === 'backtest' ? backtestSignalsTable : liveSignalsTable;
                     if (!response.success || !table) return;
                     const signals = response.signals || [];
-
-                    if (targetMode === 'live') {
-                        const fp = buildLiveSignalsFingerprint(signals);
-                        if (liveRowsBaselineReady && liveScannerRunning && fp !== lastLiveRowsFingerprint) {
-                            playSignalAlert();
-                        }
-                        lastLiveRowsFingerprint = fp;
-                        liveRowsBaselineReady = true;
-                    }
 
                     const rows = signals.map(function(signal) {
                         return signalToRow(signal, targetMode);
@@ -1719,10 +1739,12 @@
             const total = Number(data.scripts_total || 0);
             const strikesScanned = Number(data.last_strikes_scanned || 0);
             const strikesTotal = Number(data.strikes_total || 0);
+            const skippedCandles = Number(data.skipped_candles || 0);
             const workers = formatWorkers(data.workers);
             const autoTuneSuffix = formatAutoTuneSuffix(data);
             $('#liveScriptsScanned').text(total > 0 ? (scanned + ' / ' + total) : String(scanned));
             $('#liveStrikesScanned').text(strikesTotal > 0 ? (strikesScanned + ' / ' + strikesTotal) : String(strikesScanned));
+            $('#liveSkippedCandles').text(String(skippedCandles));
             $('#liveWorkers').text(workers);
             $('#liveSignalsGenerated').text(Number(data.last_signals || 0));
             if (running) {
@@ -1805,6 +1827,7 @@
 
         if (type === 'backtest') {
             backtestRunning = running;
+            updateBacktestLogDownloadButton(data);
             activeConfigIds.backtest = data.config_id || activeConfigIds.backtest;
             $('#backtestStartedAt').text(formatTime(data.started_at));
             $('#backtestFinishedAt').text(running ? '--' : formatTime(data.finished_at));
@@ -1814,27 +1837,54 @@
             $('#backtestSignals').text(latestSignalCounts.backtest || 0);
             const scanned = Number(data.scripts_scanned || 0);
             const total = Number(data.scripts_total || 0);
+            const strikesScanned = Number(data.strikes_scanned || 0);
+            const strikesTotal = Number(data.strikes_total || 0);
             const signals = Number(data.signals || 0);
+            const skippedCandles = Number(data.candles_missing || 0);
             const workers = formatWorkers(data.workers);
             const autoTuneSuffix = formatAutoTuneSuffix(data);
+            const outcome = String(data.run_outcome || '').toLowerCase();
+            if (!running) {
+                if (outcome === 'failed' || data.last_error) {
+                    badge.removeClass('bg-secondary bg-success').addClass('bg-danger').text('Error');
+                    text.text('Failed');
+                } else if (outcome === 'stopped' || data.stopped_by_user === true) {
+                    badge.removeClass('bg-secondary bg-success bg-danger').addClass('bg-warning').text('Stopped');
+                    text.text('Stopped');
+                } else if (data.finished_at) {
+                    badge.removeClass('bg-secondary bg-danger bg-warning').addClass('bg-success').text('Completed');
+                    text.text('Completed');
+                }
+            }
             backtestObservedScanned = Math.max(backtestObservedScanned, isFinite(scanned) ? scanned : 0);
             backtestObservedTotal = Math.max(backtestObservedTotal, isFinite(total) ? total : 0);
+            backtestObservedStrikesScanned = Math.max(backtestObservedStrikesScanned, isFinite(strikesScanned) ? strikesScanned : 0);
+            backtestObservedStrikesTotal = Math.max(backtestObservedStrikesTotal, isFinite(strikesTotal) ? strikesTotal : 0);
             backtestObservedSignals = Math.max(backtestObservedSignals, isFinite(signals) ? signals : 0);
             $('#backtestScriptsScanned').text(
                 backtestObservedTotal > 0
                     ? (backtestObservedScanned + ' / ' + backtestObservedTotal)
                     : String(backtestObservedScanned)
             );
+            $('#backtestStrikesScanned').text(
+                backtestObservedStrikesTotal > 0
+                    ? (backtestObservedStrikesScanned + ' / ' + backtestObservedStrikesTotal)
+                    : String(backtestObservedStrikesScanned)
+            );
+            $('#backtestSkippedCandles').text(String(skippedCandles));
             $('#backtestWorkers').text(workers);
             $('#backtestSignalsGenerated').text(backtestObservedSignals);
             if (running) {
                 const scannedDisplay = backtestObservedTotal > 0
                     ? (backtestObservedScanned + ' / ' + backtestObservedTotal)
                     : String(backtestObservedScanned);
+                const strikesDisplay = backtestObservedStrikesTotal > 0
+                    ? (backtestObservedStrikesScanned + ' / ' + backtestObservedStrikesTotal)
+                    : String(backtestObservedStrikesScanned);
                 $('#backtestProcessNote')
                     .removeClass('text-muted text-success text-danger')
                     .addClass('text-warning')
-                    .html('<span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>Backtest is processing historical candles... Scripts scanned: ' + scannedDisplay + '. Workers: ' + workers + '.' + autoTuneSuffix);
+                    .html('<span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>Backtest is processing historical candles... Scripts scanned: ' + scannedDisplay + '. Strikes scanned: ' + strikesDisplay + '. Workers: ' + workers + '.' + autoTuneSuffix);
                 $('#btnStartBacktest')
                     .removeClass('btn-primary')
                     .addClass('btn-danger')
@@ -1847,16 +1897,26 @@
                     .html('<i class="bi bi-hourglass-split"></i> Backtest Running...')
                     .prop('disabled', true);
             } else if (data.finished_at) {
-                if ((data.signals || 0) > 0) {
+                if (outcome === 'stopped' || data.stopped_by_user === true) {
+                    $('#backtestProcessNote')
+                        .removeClass('text-muted text-success text-danger')
+                        .addClass('text-warning')
+                        .text((data.completion_note || 'Backtest stopped by user.') + ' Scripts scanned: ' + backtestObservedScanned + '. Strikes scanned: ' + backtestObservedStrikesScanned + '.');
+                } else if (outcome === 'failed' || data.last_error) {
+                    $('#backtestProcessNote')
+                        .removeClass('text-muted text-warning text-success')
+                        .addClass('text-danger')
+                        .text(data.completion_note || 'Backtest failed. Check error details.');
+                } else if ((data.signals || 0) > 0) {
                     $('#backtestProcessNote')
                         .removeClass('text-muted text-warning text-danger')
                         .addClass('text-success')
-                        .text('Backtest completed. Signals generated: ' + (data.signals || 0) + '.');
+                        .text((data.completion_note || 'Backtest completed.') + ' Signals generated: ' + (data.signals || 0) + '.');
                 } else {
                     $('#backtestProcessNote')
                         .removeClass('text-muted text-warning text-success text-danger')
                         .addClass('text-muted')
-                        .text('Backtest completed. No signals generated.');
+                        .text((data.completion_note || 'Backtest completed.') + ' No signals generated.');
                 }
                 $('#btnStartBacktest')
                     .removeClass('btn-danger')
@@ -1869,6 +1929,18 @@
                 $('#btnRunBacktest')
                     .html('2. Fetch Stocks')
                     .prop('disabled', false);
+
+                const outcomeToken = [String(data.finished_at || ''), String(outcome || 'completed'), String(data.last_error || '')].join('|');
+                if (outcomeToken && outcomeToken !== lastBacktestOutcomeToken) {
+                    lastBacktestOutcomeToken = outcomeToken;
+                    if (outcome === 'failed' || data.last_error) {
+                        alert('Backtest failed. ' + (data.last_error || 'Check Error details in Backtest Status.'));
+                    } else if (outcome === 'stopped' || data.stopped_by_user === true) {
+                        alert('Backtest stopped by user.');
+                    } else {
+                        alert('Backtest completed successfully.');
+                    }
+                }
             } else {
                 if (backtestStartPending) {
                     $('#backtestProcessNote')
@@ -1938,5 +2010,191 @@
         }
         window.location.href = url;
     }
+
+    async function downloadLatestBacktestLog() {
+        const btn = $('#btnDownloadBacktestLog');
+        if (btn.prop('disabled')) {
+            return;
+        }
+        const originalHtml = btn.html();
+        btn.prop('disabled', true).html('<i class="fas fa-hourglass-half"></i> Preparing...');
+        const urls = [
+            '/api/backtest/logs/latest?t=' + Date.now(),
+            '/scanner/api/backtest/logs/latest?t=' + Date.now()
+        ];
+
+        try {
+            for (let i = 0; i < urls.length; i += 1) {
+                const response = await fetch(urls[i], { method: 'GET', credentials: 'same-origin' });
+                if (!response.ok) {
+                    if (response.status === 404) {
+                        continue;
+                    }
+                    let message = 'Failed to download backtest log. HTTP ' + response.status + '.';
+                    try {
+                        const payload = await response.json();
+                        if (payload && payload.error) {
+                            message = payload.error;
+                        }
+                    } catch (e) {
+                        try {
+                            const text = await response.text();
+                            if (text) {
+                                message = message + ' ' + text.slice(0, 160);
+                            }
+                        } catch (e2) {}
+                    }
+                    // Fallback: let browser navigate directly (can still download if fetch path had issue).
+                    window.location.href = '/scanner/api/backtest/logs/latest?t=' + Date.now();
+                    alert(message + ' Trying direct download...');
+                    return;
+                }
+
+                const blob = await response.blob();
+                const cd = response.headers.get('Content-Disposition') || '';
+                let filename = 'backtest_scan_latest.log';
+                const match = cd.match(/filename=\"?([^\";]+)\"?/i);
+                if (match && match[1]) {
+                    filename = match[1];
+                }
+                const link = document.createElement('a');
+                const objectUrl = URL.createObjectURL(blob);
+                link.href = objectUrl;
+                link.download = filename;
+                document.body.appendChild(link);
+                link.click();
+                link.remove();
+                URL.revokeObjectURL(objectUrl);
+                return;
+            }
+            window.location.href = '/scanner/api/backtest/logs/latest?t=' + Date.now();
+            alert('No backtest log file found via fetch. Trying direct download...');
+        } finally {
+            btn.prop('disabled', false).html(originalHtml);
+        }
+    }
+
+    async function downloadLatestBacktestCsv() {
+        const btn = $('#btnDownloadBacktestCsv');
+        if (btn.prop('disabled')) {
+            return;
+        }
+        const originalHtml = btn.html();
+        btn.prop('disabled', true).html('<i class="fas fa-hourglass-half"></i> Preparing...');
+        const urls = [
+            '/api/backtest/logs/latest-csv?t=' + Date.now(),
+            '/scanner/api/backtest/logs/latest-csv?t=' + Date.now()
+        ];
+
+        try {
+            for (let i = 0; i < urls.length; i += 1) {
+                const response = await fetch(urls[i], { method: 'GET', credentials: 'same-origin' });
+                if (!response.ok) {
+                    if (response.status === 404) {
+                        continue;
+                    }
+                    let message = 'Failed to download backtest CSV log. HTTP ' + response.status + '.';
+                    try {
+                        const payload = await response.json();
+                        if (payload && payload.error) {
+                            message = payload.error;
+                        }
+                    } catch (e) {
+                        try {
+                            const text = await response.text();
+                            if (text) {
+                                message = message + ' ' + text.slice(0, 160);
+                            }
+                        } catch (e2) {}
+                    }
+                    window.location.href = '/api/backtest/logs/latest-csv?t=' + Date.now();
+                    alert(message + ' Trying direct download...');
+                    return;
+                }
+
+                const blob = await response.blob();
+                const cd = response.headers.get('Content-Disposition') || '';
+                let filename = 'backtest_scan_latest.csv';
+                const match = cd.match(/filename=\"?([^\";]+)\"?/i);
+                if (match && match[1]) {
+                    filename = match[1];
+                }
+                const link = document.createElement('a');
+                const objectUrl = URL.createObjectURL(blob);
+                link.href = objectUrl;
+                link.download = filename;
+                document.body.appendChild(link);
+                link.click();
+                link.remove();
+                URL.revokeObjectURL(objectUrl);
+                return;
+            }
+            window.location.href = '/api/backtest/logs/latest-csv?t=' + Date.now();
+            alert('No backtest CSV log file found via fetch. Trying direct download...');
+        } finally {
+            btn.prop('disabled', false).html(originalHtml);
+        }
+    }
+
+    async function downloadLatestErrorLog() {
+        const btn = $('#btnDownloadErrorLog');
+        const originalHtml = btn.html();
+        btn.prop('disabled', true).html('<i class="fas fa-hourglass-half"></i> Preparing...');
+        const urls = [
+            '/api/error-logs/latest?t=' + Date.now(),
+            '/scanner/api/error-logs/latest?t=' + Date.now()
+        ];
+
+        try {
+            for (let i = 0; i < urls.length; i += 1) {
+                const response = await fetch(urls[i], { method: 'GET', credentials: 'same-origin' });
+                if (!response.ok) {
+                    if (response.status === 404) {
+                        continue;
+                    }
+                    let message = 'Failed to download error log.';
+                    try {
+                        const payload = await response.json();
+                        if (payload && payload.error) {
+                            message = payload.error;
+                        }
+                    } catch (e) {}
+                    alert(message);
+                    return;
+                }
+
+                const blob = await response.blob();
+                const cd = response.headers.get('Content-Disposition') || '';
+                let filename = 'api_error_latest.log';
+                const match = cd.match(/filename=\"?([^\";]+)\"?/i);
+                if (match && match[1]) {
+                    filename = match[1];
+                }
+                const link = document.createElement('a');
+                const objectUrl = URL.createObjectURL(blob);
+                link.href = objectUrl;
+                link.download = filename;
+                document.body.appendChild(link);
+                link.click();
+                link.remove();
+                URL.revokeObjectURL(objectUrl);
+                return;
+            }
+            alert('No API error log file found yet for this user.');
+        } finally {
+            btn.prop('disabled', false).html(originalHtml);
+        }
+    }
+
+    function updateBacktestLogDownloadButton(backtestData) {
+        const logBtn = $('#btnDownloadBacktestLog');
+        const csvBtn = $('#btnDownloadBacktestCsv');
+        if (!logBtn.length && !csvBtn.length) return;
+        const data = backtestData || {};
+        const ready = data.running !== true;
+        logBtn.prop('disabled', !ready);
+        csvBtn.prop('disabled', !ready);
+    }
 </script>
 {% endblock %}
+

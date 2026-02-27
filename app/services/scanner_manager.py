@@ -66,7 +66,7 @@ def _parse_iso_utc(value):
         return None
 
 
-def _timeframe_minutes(value, default=5):
+def _timeframe_minutes(value, default=15):
     text = str(value or '').strip().lower()
     if text.endswith('min'):
         text = text[:-3]
@@ -113,8 +113,8 @@ def _auto_tune_workers(user_id, config_data, fallback_cap, mode='live'):
     cpu = max(1, _safe_int(os.cpu_count(), 4))
     cap = max(1, min(MAX_SCAN_WORKERS, _safe_int(fallback_cap, DEFAULT_SCAN_WORKERS)))
     profile = _scan_profile(cfg_data, user)
-    timeframe = _timeframe_minutes(cfg_data.get('timeframe'), 5)
-    strike_range = max(1, min(20, _safe_int(cfg_data.get('strikeRange'), 2 if mode_name == 'live' else 5)))
+    timeframe = _timeframe_minutes(cfg_data.get('timeframe'), 15)
+    strike_range = max(0, min(50, _safe_int(cfg_data.get('strikeRange'), 0)))
     symbol_count = _estimate_symbol_count(cfg_data.get('stockSelection', 'all'), mode_name)
 
     date_span_days = 1
@@ -128,7 +128,9 @@ def _auto_tune_workers(user_id, config_data, fallback_cap, mode='live'):
         except Exception:
             date_span_days = 7
 
-    load_units = float(symbol_count * max(2, strike_range * 2))
+    # When scanning all strikes (0), model load using a conservative wide-range proxy.
+    strike_factor = 20 if strike_range <= 0 else strike_range
+    load_units = float(symbol_count * max(2, strike_factor * 2))
     if mode_name == 'backtest':
         load_units *= float(date_span_days)
     if timeframe <= 3:
@@ -198,7 +200,7 @@ def _get_user_default_config_payload(user_id):
     timeframe_text = str(cfg.timeframe or '5')
     return {
         'stockSelection': cfg.get_stock_selection() or 'all',
-        'strikeRange': int(cfg.strike_range or 5),
+        'strikeRange': int(cfg.strike_range) if cfg.strike_range is not None else 0,
         'priceMultiplier': float(cfg.price_multiplier or 2.0),
         'timeframe': int(timeframe_text.replace('min', '') or 5),
         'refreshInterval': max(1, int((cfg.refresh_interval or 300) / 60))
@@ -216,14 +218,14 @@ def _pick_config_value(config_data, defaults, key, fallback):
 def _build_scanner_config(user_id, config_data, mode):
     user_defaults = _get_user_default_config_payload(user_id)
     stock_selection = _pick_config_value(config_data, user_defaults, 'stockSelection', 'all')
-    default_strike_range = 2 if str(mode or '').lower() == 'live' else 5
+    default_strike_range = 0
     strike_range = int(_pick_config_value(config_data, user_defaults, 'strikeRange', default_strike_range))
     price_multiplier = float(_pick_config_value(config_data, user_defaults, 'priceMultiplier', 2.0))
-    timeframe = int(_pick_config_value(config_data, user_defaults, 'timeframe', 5))
+    timeframe = int(_pick_config_value(config_data, user_defaults, 'timeframe', 15))
     allowed_timeframes = {1, 3, 5, 15, 30, 60}
     if timeframe not in allowed_timeframes:
-        timeframe = 5
-    refresh_interval = int(_pick_config_value(config_data, user_defaults, 'refreshInterval', 5)) * 60
+        timeframe = 15
+    refresh_interval = int(_pick_config_value(config_data, user_defaults, 'refreshInterval', 15)) * 60
 
     config_name = f'{mode.capitalize()} {datetime.utcnow().strftime("%Y%m%d-%H%M%S")}'
 
@@ -303,6 +305,57 @@ def _resolve_live_prefilter_settings(user_id, config_data=None):
         'top_movers': int(top_movers),
         'top_volume': int(top_volume),
         'max_stocks': int(max_stocks)
+    }
+
+
+def _resolve_backtest_runtime_settings(user_id, config_data=None):
+    cfg_data = config_data if isinstance(config_data, dict) else {}
+    user = User.query.get(user_id)
+
+    frequency = str(
+        cfg_data.get(
+            'backtestRebalanceFrequency',
+            getattr(user, 'backtest_rebalance_frequency', 'weekly')
+        )
+        or 'weekly'
+    ).strip().lower()
+    if frequency not in ('daily', 'weekly', 'monthly'):
+        frequency = 'weekly'
+
+    strict_first_candle_raw = cfg_data.get('backtestStrictFirstCandle')
+    strict_first_candle_default = bool(getattr(user, 'backtest_strict_first_candle', True))
+    strict_first_candle = (
+        _safe_bool(strict_first_candle_raw, default=strict_first_candle_default)
+        if strict_first_candle_raw is not None
+        else strict_first_candle_default
+    )
+
+    liquidity_enabled_raw = cfg_data.get('backtestLiquidityFilterEnabled')
+    liquidity_enabled_default = bool(getattr(user, 'backtest_liquidity_filter_enabled', True))
+    liquidity_enabled = (
+        _safe_bool(liquidity_enabled_raw, default=liquidity_enabled_default)
+        if liquidity_enabled_raw is not None
+        else liquidity_enabled_default
+    )
+
+    min_candles = _clamp_int(
+        cfg_data.get('backtestMinCandlesPerStrike', getattr(user, 'backtest_min_candles_per_strike', 5)),
+        2,
+        500,
+        5
+    )
+    min_avg_volume = _clamp_int(
+        cfg_data.get('backtestMinAvgVolume', getattr(user, 'backtest_min_avg_volume', 1)),
+        0,
+        1_000_000,
+        1
+    )
+    return {
+        'rebalance_frequency': frequency,
+        'strict_first_candle': bool(strict_first_candle),
+        'liquidity_filter_enabled': bool(liquidity_enabled),
+        'min_candles_per_strike': int(min_candles),
+        'min_avg_volume': int(min_avg_volume)
     }
 
 
@@ -407,6 +460,10 @@ def start_live_scan(app, user_id, config_data):
             if existing and existing.is_running:
                 return False, 'Scanner already running.'
 
+        user = User.query.get(user_id)
+        if not user:
+            return False, 'User not found.'
+
         creds = APICredential.query.filter_by(user_id=user_id).first()
         if not creds:
             return False, 'API credentials not configured.'
@@ -431,7 +488,8 @@ def start_live_scan(app, user_id, config_data):
             live_prefilter_enabled=prefilter['enabled'],
             live_prefilter_top_movers=prefilter['top_movers'],
             live_prefilter_top_volume=prefilter['top_volume'],
-            live_prefilter_max_stocks=prefilter['max_stocks']
+            live_prefilter_max_stocks=prefilter['max_stocks'],
+            api_error_log_enabled=bool(getattr(user, 'api_error_log_enabled', False))
         )
         engine.is_running = True
         selected_expiries = engine.get_selected_expiries(reference_date=datetime.now())
@@ -453,6 +511,7 @@ def start_live_scan(app, user_id, config_data):
                 'scripts_total': scripts_total,
                 'last_strikes_scanned': 0,
                 'strikes_total': 0,
+                'skipped_candles': 0,
                 'timeframe': config.timeframe,
                 'price_multiplier': float(config.price_multiplier),
                 'selected_expiries': selected_expiries,
@@ -515,6 +574,10 @@ def start_backtest(app, user_id, config_data):
         from_dt = datetime.strptime(from_date, '%Y-%m-%d')
         # Include the full end date window for historical candles.
         to_dt = datetime.strptime(to_date, '%Y-%m-%d') + timedelta(hours=23, minutes=59)
+        # Do not request future candles when end date is today.
+        now_dt = datetime.now()
+        if to_dt > now_dt:
+            to_dt = now_dt
     except Exception:
         return False, 'Invalid date format. Use YYYY-MM-DD.'
 
@@ -524,6 +587,10 @@ def start_backtest(app, user_id, config_data):
             existing_engine = _backtest_jobs.get(user_id)
             if existing_status and existing_status.get('running') and existing_engine:
                 return False, 'Backtest already running.'
+
+        user = User.query.get(user_id)
+        if not user:
+            return False, 'User not found.'
 
         clear_previous_raw = config_data.get('clearPrevious', True)
         if isinstance(clear_previous_raw, str):
@@ -549,7 +616,20 @@ def start_backtest(app, user_id, config_data):
 
         config = _build_scanner_config(user_id, config_data, mode='backtest')
         worker_count, tune_detail = _effective_worker_count(user_id, config_data, mode='backtest')
-        engine = ScannerEngine(user_id=user_id, config=config, angel_api=angel_api, workers=worker_count)
+        backtest_runtime = _resolve_backtest_runtime_settings(user_id, config_data)
+        engine = ScannerEngine(
+            user_id=user_id,
+            config=config,
+            angel_api=angel_api,
+            workers=worker_count,
+            backtest_rebalance_frequency=backtest_runtime['rebalance_frequency'],
+            backtest_strict_first_candle=backtest_runtime['strict_first_candle'],
+            backtest_liquidity_filter_enabled=backtest_runtime['liquidity_filter_enabled'],
+            backtest_min_candles_per_strike=backtest_runtime['min_candles_per_strike'],
+            backtest_min_avg_volume=backtest_runtime['min_avg_volume'],
+            backtest_scan_log_enabled=bool(getattr(user, 'backtest_scan_log_enabled', False)),
+            api_error_log_enabled=bool(getattr(user, 'api_error_log_enabled', False))
+        )
         engine.is_running = True
         try:
             planned_scripts = len(engine._resolve_stock_selection())
@@ -569,15 +649,29 @@ def start_backtest(app, user_id, config_data):
                 'finished_at': None,
                 'last_error': None,
                 'stopped_by_user': False,
+                'run_outcome': 'running',
+                'completion_note': 'Backtest is running.',
                 'signals': 0,
                 'scripts_scanned': 0,
                 'scripts_total': scripts_total,
+                'strikes_scanned': 0,
+                'strikes_total': 0,
+                'candles_missing': 0,
+                'instruments_missing': 0,
                 'from_date': from_dt.strftime('%Y-%m-%d'),
                 'to_date': to_dt.strftime('%Y-%m-%d'),
                 'timeframe': config.timeframe,
                 'price_multiplier': float(config.price_multiplier),
                 'selected_expiries': selected_expiries,
                 'workers': worker_count,
+                'backtest_log_enabled': bool(getattr(user, 'backtest_scan_log_enabled', False)),
+                'latest_backtest_log': None,
+                'latest_backtest_csv': None,
+                'rebalance_frequency': backtest_runtime['rebalance_frequency'],
+                'strict_first_candle': bool(backtest_runtime['strict_first_candle']),
+                'liquidity_filter_enabled': bool(backtest_runtime['liquidity_filter_enabled']),
+                'min_candles_per_strike': int(backtest_runtime['min_candles_per_strike']),
+                'min_avg_volume': int(backtest_runtime['min_avg_volume']),
                 'auto_tune': bool(tune_detail.get('enabled')),
                 'auto_tune_summary': tune_detail.get('summary'),
                 'auto_tune_details': tune_detail,
@@ -592,7 +686,11 @@ def start_backtest(app, user_id, config_data):
             name=f'backtest-{user_id}'
         ).start()
 
-    return True, f'Backtest started successfully. Workers: {worker_count}. {tune_detail.get("summary", "")}'.strip()
+    return True, (
+        f'Backtest started successfully. Workers: {worker_count}. '
+        f'Rebalance: {backtest_runtime["rebalance_frequency"]}. '
+        f'{tune_detail.get("summary", "")}'
+    ).strip()
 
 
 def _run_backtest(app, engine, from_dt, to_dt):
@@ -607,7 +705,7 @@ def _run_backtest(app, engine, from_dt, to_dt):
             if status:
                 status['scripts_total'] = _safe_int(status.get('scripts_total', 0) or planned_scripts)
 
-        def _progress(user_id, scripts_scanned=None, signals=None):
+        def _progress(user_id, scripts_scanned=None, strikes_scanned=None, strikes_total=None, signals=None):
             with _lock:
                 status = _backtest_status.get(user_id)
                 if not status:
@@ -621,6 +719,16 @@ def _run_backtest(app, engine, from_dt, to_dt):
                     status['signals'] = max(
                         _safe_int(status.get('signals', 0)),
                         _safe_int(signals)
+                    )
+                if strikes_scanned is not None:
+                    status['strikes_scanned'] = max(
+                        _safe_int(status.get('strikes_scanned', 0)),
+                        _safe_int(strikes_scanned)
+                    )
+                if strikes_total is not None:
+                    status['strikes_total'] = max(
+                        _safe_int(status.get('strikes_total', 0)),
+                        _safe_int(strikes_total)
                     )
                 status['scripts_total'] = max(
                     _safe_int(status.get('scripts_total', 0)),
@@ -650,16 +758,49 @@ def _run_backtest(app, engine, from_dt, to_dt):
                         _safe_int(status.get('scripts_total', 0)),
                         _safe_int(getattr(engine, 'last_backtest_scripts_total', 0) or planned_scripts)
                     )
-                    status['stopped_by_user'] = (engine.is_running is False)
+                    status['strikes_scanned'] = _safe_int(getattr(engine, 'last_backtest_strikes_scanned', 0) or 0)
+                    status['strikes_total'] = _safe_int(getattr(engine, 'last_backtest_strikes_total', 0) or 0)
+                    status['candles_missing'] = _safe_int(getattr(engine, 'last_backtest_candles_missing', 0) or 0)
+                    status['instruments_missing'] = _safe_int(getattr(engine, 'last_backtest_instruments_missing', 0) or 0)
+                    # Preserve explicit stop requests set by stop_backtest();
+                    # normal completion should remain "not stopped by user".
+                    status['stopped_by_user'] = bool(status.get('stopped_by_user', False))
+                    status['run_outcome'] = 'stopped' if status['stopped_by_user'] else 'completed'
+                    status['latest_backtest_log'] = getattr(engine, '_backtest_log_path', None)
+                    status['latest_backtest_csv'] = getattr(engine, '_backtest_csv_path', None)
+                    log_generated = bool(status.get('latest_backtest_log')) and os.path.exists(str(status.get('latest_backtest_log')))
+                    csv_generated = bool(status.get('latest_backtest_csv')) and os.path.exists(str(status.get('latest_backtest_csv')))
+                    if status['stopped_by_user']:
+                        status['completion_note'] = 'Backtest stopped by user.'
+                    elif bool(status.get('backtest_log_enabled')):
+                        status['completion_note'] = (
+                            'Backtest completed. Diagnostic logs generated.'
+                            if (log_generated or csv_generated)
+                            else 'Backtest completed. Diagnostic log files were not generated.'
+                        )
+                    else:
+                        status['completion_note'] = 'Backtest completed.'
+                    if _safe_int(status.get('signals', 0), 0) == 0:
+                        missing_info = (
+                            f' Missing candles: {_safe_int(status.get("candles_missing", 0), 0)}'
+                            f', missing instruments: {_safe_int(status.get("instruments_missing", 0), 0)}.'
+                        )
+                        status['completion_note'] = f'{status["completion_note"]}{missing_info}'
                     recent = list(status.get('recent_runs') or [])
                     recent.insert(0, {
                         'finished_at': status['finished_at'],
                         'duration_ms': duration_ms,
                         'scripts_scanned': _safe_int(status.get('scripts_scanned', 0)),
                         'scripts_total': _safe_int(status.get('scripts_total', 0)),
+                        'strikes_scanned': _safe_int(status.get('strikes_scanned', 0)),
+                        'strikes_total': _safe_int(status.get('strikes_total', 0)),
+                        'candles_missing': _safe_int(status.get('candles_missing', 0)),
+                        'instruments_missing': _safe_int(status.get('instruments_missing', 0)),
                         'signals': _safe_int(status.get('signals', 0)),
                         'workers': _safe_int(status.get('workers', 0)),
                         'stopped_by_user': bool(status.get('stopped_by_user', False)),
+                        'outcome': status.get('run_outcome'),
+                        'log_generated': bool(log_generated or csv_generated),
                         'error': None
                     })
                     status['recent_runs'] = recent[:10]
@@ -683,16 +824,30 @@ def _run_backtest(app, engine, from_dt, to_dt):
                         _safe_int(status.get('scripts_total', 0)),
                         _safe_int(getattr(engine, 'last_backtest_scripts_total', 0) or planned_scripts)
                     )
+                    status['strikes_scanned'] = _safe_int(getattr(engine, 'last_backtest_strikes_scanned', 0) or 0)
+                    status['strikes_total'] = _safe_int(getattr(engine, 'last_backtest_strikes_total', 0) or 0)
+                    status['candles_missing'] = _safe_int(getattr(engine, 'last_backtest_candles_missing', 0) or 0)
+                    status['instruments_missing'] = _safe_int(getattr(engine, 'last_backtest_instruments_missing', 0) or 0)
                     status['last_error'] = str(e)
+                    status['run_outcome'] = 'failed'
+                    status['latest_backtest_log'] = getattr(engine, '_backtest_log_path', None)
+                    status['latest_backtest_csv'] = getattr(engine, '_backtest_csv_path', None)
+                    status['completion_note'] = 'Backtest failed.'
                     recent = list(status.get('recent_runs') or [])
                     recent.insert(0, {
                         'finished_at': status['finished_at'],
                         'duration_ms': duration_ms,
                         'scripts_scanned': _safe_int(status.get('scripts_scanned', 0)),
                         'scripts_total': _safe_int(status.get('scripts_total', 0)),
+                        'strikes_scanned': _safe_int(status.get('strikes_scanned', 0)),
+                        'strikes_total': _safe_int(status.get('strikes_total', 0)),
+                        'candles_missing': _safe_int(status.get('candles_missing', 0)),
+                        'instruments_missing': _safe_int(status.get('instruments_missing', 0)),
                         'signals': _safe_int(status.get('signals', 0)),
                         'workers': _safe_int(status.get('workers', 0)),
                         'stopped_by_user': bool(status.get('stopped_by_user', False)),
+                        'outcome': status.get('run_outcome'),
+                        'log_generated': bool(status.get('latest_backtest_log') or status.get('latest_backtest_csv')),
                         'error': str(e)
                     })
                     status['recent_runs'] = recent[:10]
@@ -711,6 +866,8 @@ def stop_backtest(user_id):
         engine.stop_backtest()
         status['running'] = False
         status['stopped_by_user'] = True
+        status['run_outcome'] = 'stopped'
+        status['completion_note'] = 'Backtest stopped by user.'
         status['finished_at'] = datetime.utcnow().isoformat() + 'Z'
     return True, 'Backtest stop requested.'
 
@@ -723,7 +880,8 @@ def _update_live_status(
     stocks_scanned=None,
     stocks_total=None,
     strikes_scanned=None,
-    strikes_total=None
+    strikes_total=None,
+    skipped_candles=None
 ):
     emit_progress = False
     progress_payload = None
@@ -751,6 +909,8 @@ def _update_live_status(
             status['last_strikes_scanned'] = strikes_scanned
         if strikes_total is not None:
             status['strikes_total'] = strikes_total
+        if skipped_candles is not None:
+            status['skipped_candles'] = skipped_candles
         if error:
             status['last_error'] = error
         elif last_run_at or signals is not None:
@@ -770,6 +930,7 @@ def _update_live_status(
                 'stocks_total': _safe_int(status.get('scripts_total', 0)),
                 'strikes_scanned': _safe_int(status.get('last_strikes_scanned', 0)),
                 'strikes_total': _safe_int(status.get('strikes_total', 0)),
+                'skipped_candles': _safe_int(status.get('skipped_candles', 0)),
                 'signals': _safe_int(status.get('last_signals', 0)),
                 'workers': _safe_int(status.get('workers', 0)),
                 'auto_tune': bool(status.get('auto_tune', False)),
@@ -782,6 +943,7 @@ def _update_live_status(
             or stocks_total is not None
             or strikes_scanned is not None
             or strikes_total is not None
+            or skipped_candles is not None
         ):
             emit_progress = True
             progress_payload = {
@@ -790,6 +952,7 @@ def _update_live_status(
                 'stocks_total': _safe_int(status.get('scripts_total', 0)),
                 'strikes_scanned': _safe_int(status.get('last_strikes_scanned', 0)),
                 'strikes_total': _safe_int(status.get('strikes_total', 0)),
+                'skipped_candles': _safe_int(status.get('skipped_candles', 0)),
                 'running': bool(status.get('running', False)),
                 'updated_at': datetime.utcnow().isoformat() + 'Z'
             }
@@ -818,5 +981,21 @@ def get_backtest_status(user_id):
             status['scripts_total'] = max(
                 _safe_int(status.get('scripts_total', 0)),
                 _safe_int(getattr(engine, 'last_backtest_scripts_total', 0))
+            )
+            status['strikes_scanned'] = max(
+                _safe_int(status.get('strikes_scanned', 0)),
+                _safe_int(getattr(engine, 'last_backtest_strikes_scanned', 0))
+            )
+            status['strikes_total'] = max(
+                _safe_int(status.get('strikes_total', 0)),
+                _safe_int(getattr(engine, 'last_backtest_strikes_total', 0))
+            )
+            status['candles_missing'] = max(
+                _safe_int(status.get('candles_missing', 0)),
+                _safe_int(getattr(engine, 'last_backtest_candles_missing', 0))
+            )
+            status['instruments_missing'] = max(
+                _safe_int(status.get('instruments_missing', 0)),
+                _safe_int(getattr(engine, 'last_backtest_instruments_missing', 0))
             )
         return status

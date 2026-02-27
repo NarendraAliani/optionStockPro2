@@ -6,7 +6,8 @@ try:
     import pyotp
 except Exception:
     pyotp = None
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
+from collections import deque
 import time
 import logging
 import os
@@ -118,13 +119,15 @@ class AngelOneAPI:
             'https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json'
         )
         self.root_url = os.getenv('SMARTAPI_ROOT_URL')
-        self.rate_limit_rps = float(os.getenv('SMARTAPI_RATE_LIMIT_RPS', '4'))
-        self.retry_max = int(os.getenv('SMARTAPI_RETRY_MAX', '2'))
-        self.retry_base = float(os.getenv('SMARTAPI_RETRY_BASE_SECONDS', '0.5'))
-        self.rate_limit_retry_max = int(os.getenv('SMARTAPI_RATE_LIMIT_RETRY_MAX', '5'))
-        self.rate_limit_retry_base = float(os.getenv('SMARTAPI_RATE_LIMIT_RETRY_BASE_SECONDS', '1.5'))
+        self.rate_limit_rps = float(os.getenv('SMARTAPI_RATE_LIMIT_RPS', '2'))
+        self.retry_max = int(os.getenv('SMARTAPI_RETRY_MAX', '3'))
+        self.retry_base = float(os.getenv('SMARTAPI_RETRY_BASE_SECONDS', '1.0'))
+        self.rate_limit_retry_max = int(os.getenv('SMARTAPI_RATE_LIMIT_RETRY_MAX', '7'))
+        self.rate_limit_retry_base = float(os.getenv('SMARTAPI_RATE_LIMIT_RETRY_BASE_SECONDS', '2.0'))
         self._last_call_at = None
         self._last_rate_limit_log_at = 0.0
+        self._request_times = deque()
+        self._rate_limit_times = deque()
         self.last_error = None
         self._client_public_ip = os.getenv('SMARTAPI_CLIENT_PUBLIC_IP')
         self._client_local_ip = os.getenv('SMARTAPI_CLIENT_LOCAL_IP')
@@ -426,6 +429,7 @@ class AngelOneAPI:
         for attempt in range(max_attempts + 1):
             try:
                 self._throttle()
+                self._record_request()
                 result = func(*args, **kwargs)
                 if self._is_rate_limit_response(result):
                     message = self._extract_error_message(result) or 'Access denied because of exceeding access rate'
@@ -434,6 +438,8 @@ class AngelOneAPI:
             except Exception as e:
                 last_error = e
                 is_rate_limit = self._is_rate_limit_error(e)
+                if is_rate_limit:
+                    self._record_rate_limit()
                 allowed_retries = self.rate_limit_retry_max if is_rate_limit else self.retry_max
                 if attempt < allowed_retries:
                     sleep_for = rate_delay if is_rate_limit else delay
@@ -481,6 +487,36 @@ class AngelOneAPI:
         if now - self._last_rate_limit_log_at >= 30:
             logger.warning(message)
             self._last_rate_limit_log_at = now
+
+    def _record_request(self):
+        now = time.time()
+        self._request_times.append(now)
+        self._trim_times(self._request_times, now, window_seconds=60)
+
+    def _record_rate_limit(self):
+        now = time.time()
+        self._rate_limit_times.append(now)
+        self._trim_times(self._rate_limit_times, now, window_seconds=60)
+
+    @staticmethod
+    def _trim_times(queue, now, window_seconds=60):
+        cutoff = now - float(window_seconds)
+        while queue and queue[0] < cutoff:
+            queue.popleft()
+
+    def get_rate_limit_stats(self, window_seconds=60, clear=False):
+        now = time.time()
+        self._trim_times(self._request_times, now, window_seconds=window_seconds)
+        self._trim_times(self._rate_limit_times, now, window_seconds=window_seconds)
+        stats = {
+            'window_seconds': int(window_seconds),
+            'requests': len(self._request_times),
+            'rate_limit_hits': len(self._rate_limit_times)
+        }
+        if clear:
+            self._request_times.clear()
+            self._rate_limit_times.clear()
+        return stats
 
     def load_scrip_master(self):
         """
@@ -1118,6 +1154,69 @@ class AngelOneAPI:
         
         except Exception as e:
             logger.error(f'Error fetching option chain for {symbol}: {str(e)}')
+            return None
+
+    def _format_greeks_expiry(self, expiry):
+        """Convert input expiry to SmartAPI optionGreek format: DDMMMYYYY (e.g., 27FEB2025)."""
+        parsed = self._parse_expiry(expiry)
+        if isinstance(parsed, date):
+            return parsed.strftime('%d%b%Y').upper()
+        return None
+
+    def get_option_greeks(self, symbol, expiry, exchange='NFO'):
+        """
+        Fetch option Greeks matrix for an underlying and expiry.
+
+        Args:
+            symbol: Underlying symbol (e.g., NIFTY, BANKNIFTY)
+            expiry: Expiry as date/datetime or parseable string
+            exchange: Reserved for compatibility (SmartAPI endpoint uses name + expirydate)
+
+        Returns:
+            dict|None: {
+                'symbol': str,
+                'expiry': str (DDMMMYYYY),
+                'exchange': str,
+                'rows': list[dict]
+            }
+        """
+        try:
+            if not self.smart_api:
+                logger.error('SmartAPI client not initialized. Call authenticate() first.')
+                return None
+
+            name = (symbol or '').strip().upper()
+            if not name:
+                logger.error('Option Greeks fetch failed: symbol is required.')
+                return None
+
+            expiry_text = self._format_greeks_expiry(expiry)
+            if not expiry_text:
+                logger.error(f'Option Greeks fetch failed: invalid expiry "{expiry}".')
+                return None
+
+            params = {
+                'name': name,
+                'expirydate': expiry_text
+            }
+            response = self._with_retry(self.smart_api.optionGreek, params)
+            if not isinstance(response, dict) or not response.get('status'):
+                msg = self._extract_error_message(response) if isinstance(response, dict) else 'Unknown response'
+                logger.error(f'Option Greeks fetch failed for {name} {expiry_text}: {msg}')
+                return None
+
+            rows = response.get('data')
+            if not isinstance(rows, list):
+                rows = []
+
+            return {
+                'symbol': name,
+                'expiry': expiry_text,
+                'exchange': (exchange or 'NFO').upper(),
+                'rows': rows
+            }
+        except Exception as e:
+            logger.error(f'Error fetching option Greeks for {symbol}: {str(e)}')
             return None
     
     def subscribe_live_feed(self, symbols, callback):

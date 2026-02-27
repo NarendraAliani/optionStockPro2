@@ -1,7 +1,7 @@
 """
 API Routes for AJAX and WebSocket
 """
-from flask import Blueprint, jsonify, request, Response
+from flask import Blueprint, jsonify, request, Response, send_file
 from flask_login import login_required, current_user
 from app import socketio, db
 from app.services.scanner_manager import (
@@ -23,6 +23,7 @@ import csv
 import io
 import os
 import re
+from pathlib import Path
 from sqlalchemy import inspect as sa_inspect
 
 api_bp = Blueprint('api', __name__)
@@ -426,6 +427,99 @@ def export_signals_csv():
         output.getvalue(),
         mimetype='text/csv',
         headers={'Content-Disposition': f'attachment; filename={filename}'}
+    )
+
+
+@api_bp.route('/backtest/logs/latest', methods=['GET'])
+@login_required
+def download_latest_backtest_log():
+    """Download latest backtest scan log for current user."""
+    logs_dir = Path('logs')
+    if not logs_dir.exists() or not logs_dir.is_dir():
+        return jsonify({'success': False, 'error': 'Log directory not found.'}), 404
+
+    prefix = f'backtest_scan_user_{current_user.id}_'
+    candidates = []
+    for path in logs_dir.iterdir():
+        if not path.is_file():
+            continue
+        if not path.name.startswith(prefix) or not path.name.endswith('.log'):
+            continue
+        candidates.append(path)
+
+    if not candidates:
+        return jsonify({'success': False, 'error': 'No backtest log file found for this user yet.'}), 404
+
+    latest = max(candidates, key=lambda p: p.stat().st_mtime).resolve()
+    if not latest.exists():
+        return jsonify({'success': False, 'error': 'Latest backtest log file was not found on disk.'}), 404
+    return send_file(
+        latest,
+        as_attachment=True,
+        download_name=latest.name,
+        mimetype='text/plain'
+    )
+
+
+@api_bp.route('/backtest/logs/latest-csv', methods=['GET'])
+@login_required
+def download_latest_backtest_log_csv():
+    """Download latest backtest diagnostic CSV log for current user."""
+    logs_dir = Path('logs')
+    if not logs_dir.exists() or not logs_dir.is_dir():
+        return jsonify({'success': False, 'error': 'Log directory not found.'}), 404
+
+    prefix = f'backtest_scan_user_{current_user.id}_'
+    candidates = []
+    for path in logs_dir.iterdir():
+        if not path.is_file():
+            continue
+        if not path.name.startswith(prefix) or not path.name.endswith('.csv'):
+            continue
+        candidates.append(path)
+
+    if not candidates:
+        return jsonify({'success': False, 'error': 'No backtest CSV log file found for this user yet.'}), 404
+
+    latest = max(candidates, key=lambda p: p.stat().st_mtime).resolve()
+    if not latest.exists():
+        return jsonify({'success': False, 'error': 'Latest backtest CSV log file was not found on disk.'}), 404
+    return send_file(
+        latest,
+        as_attachment=True,
+        download_name=latest.name,
+        mimetype='text/csv'
+    )
+
+
+@api_bp.route('/error-logs/latest', methods=['GET'])
+@login_required
+def download_latest_error_log():
+    """Download latest API error log for current user."""
+    logs_dir = Path('logs')
+    if not logs_dir.exists() or not logs_dir.is_dir():
+        return jsonify({'success': False, 'error': 'Log directory not found.'}), 404
+
+    prefix = f'api_error_user_{current_user.id}_'
+    candidates = []
+    for path in logs_dir.iterdir():
+        if not path.is_file():
+            continue
+        if not path.name.startswith(prefix) or not path.name.endswith('.log'):
+            continue
+        candidates.append(path)
+
+    if not candidates:
+        return jsonify({'success': False, 'error': 'No API error log file found for this user yet.'}), 404
+
+    latest = max(candidates, key=lambda p: p.stat().st_mtime).resolve()
+    if not latest.exists():
+        return jsonify({'success': False, 'error': 'Latest error log file was not found on disk.'}), 404
+    return send_file(
+        latest,
+        as_attachment=True,
+        download_name=latest.name,
+        mimetype='text/plain'
     )
 
 

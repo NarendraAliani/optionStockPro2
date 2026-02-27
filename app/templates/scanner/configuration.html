@@ -41,8 +41,8 @@
                 <div class="form-row">
                     <div class="form-group">
                         <label class="form-label" for="strikeRange">Strike Range</label>
-                        <input type="number" class="form-control" id="strikeRange" value="5" min="1" max="20">
-                        <small class="form-help">Strikes nearest to current price</small>
+                        <input type="number" class="form-control" id="strikeRange" value="0" min="0" max="50">
+                        <small class="form-help">Use 0 to scan all available strikes; 1+ scans nearest strikes only.</small>
                     </div>
                     <div class="form-group">
                         <label class="form-label" for="priceMultiplier">Price Multiplier</label>
@@ -55,7 +55,7 @@
                             <option value="1">1 Minute</option>
                             <option value="3">3 Minutes</option>
                             <option value="5">5 Minutes</option>
-                            <option value="15">15 Minutes</option>
+                            <option value="15" selected>15 Minutes</option>
                             <option value="30">30 Minutes</option>
                             <option value="60">1 Hour</option>
                         </select>
@@ -64,8 +64,27 @@
 
                 <div class="form-row">
                     <div class="form-group">
+                        <label class="form-label" for="strikePreviewSymbol">Strike Preview Symbol</label>
+                        <select class="form-control" id="strikePreviewSymbol"></select>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="strikePreviewCmp">CMP (Spot Price)</label>
+                        <input type="number" class="form-control" id="strikePreviewCmp" value="" min="1" step="0.01">
+                        <small class="form-help">Enter the current price (CMP) to preview strikes.</small>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label d-block">&nbsp;</label>
+                        <button type="button" class="btn btn-outline-primary btn-sm" id="btnStrikePreview">
+                            <i class="fas fa-bullseye me-1"></i>Preview Strikes
+                        </button>
+                        <div id="strikePreviewResult" class="small text-muted mt-2"></div>
+                    </div>
+                </div>
+
+                <div class="form-row">
+                    <div class="form-group">
                         <label class="form-label" for="refreshInterval">Refresh Interval (minutes)</label>
-                        <input type="number" class="form-control" id="refreshInterval" value="5" min="1" max="60">
+                        <input type="number" class="form-control" id="refreshInterval" value="15" min="1" max="60">
                     </div>
                     <div class="form-group">
                         <label class="form-label" for="scanProfile">Performance Profile</label>
@@ -111,6 +130,51 @@
 
                 <div class="form-row">
                     <div class="form-group">
+                        <label class="form-label" for="backtestRebalanceFrequency">Backtest Rebalance Frequency</label>
+                        <select class="form-control" id="backtestRebalanceFrequency">
+                            <option value="daily">Daily</option>
+                            <option value="weekly">Weekly</option>
+                            <option value="monthly">Monthly</option>
+                        </select>
+                        <small class="form-help">How often baseline CMP is refreshed for strike selection.</small>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="backtestMinCandlesPerStrike">Backtest Min Candles / Strike</label>
+                        <input type="number" class="form-control" id="backtestMinCandlesPerStrike" value="5" min="2" max="500">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="backtestMinAvgVolume">Backtest Min Avg Volume</label>
+                        <input type="number" class="form-control" id="backtestMinAvgVolume" value="1" min="0" max="1000000">
+                    </div>
+                </div>
+
+                <div class="form-row">
+                    <div class="form-group">
+                        <label class="form-label d-block">Backtest Baseline And Liquidity</label>
+                        <div class="form-check mb-2">
+                            <input class="form-check-input" type="checkbox" id="backtestStrictFirstCandle" checked>
+                            <label class="form-check-label" for="backtestStrictFirstCandle">Strict First-Candle Baseline</label>
+                        </div>
+                        <div class="form-check">
+                            <input class="form-check-input" type="checkbox" id="backtestLiquidityFilterEnabled" checked>
+                            <label class="form-check-label" for="backtestLiquidityFilterEnabled">Liquidity Filter Enabled</label>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="form-row">
+                    <div class="form-group">
+                        <label class="form-label d-block">Notification Services</label>
+                        <div class="form-check form-switch mb-2">
+                            <input class="form-check-input" type="checkbox" id="notificationServicesEnabled" checked>
+                            <label class="form-check-label" for="notificationServicesEnabled">Telegram Notifications (Yes/No)</label>
+                        </div>
+                        <small class="form-help">Turn off to skip Telegram channel messaging for this user.</small>
+                    </div>
+                </div>
+
+                <div class="form-row">
+                    <div class="form-group">
                         <label class="form-label d-block">Guardrails</label>
                         <div class="form-check mb-2">
                             <input class="form-check-input" type="checkbox" id="guardrailEnabled" checked>
@@ -138,6 +202,31 @@
                 <input type="file" id="importConfigFile" accept="application/json" style="display:none;">
             </div>
             <div id="configResult" class="small text-muted mt-2"></div>
+
+            <div class="config-card mt-4">
+                <div class="config-card-header">
+                    <i class="fas fa-paper-plane"></i> Telegram Test Message
+                </div>
+                <div class="config-card-body">
+                    <div class="form-group">
+                        <label class="form-label" for="telegramTestMessage">Message</label>
+                        <textarea class="form-control" id="telegramTestMessage" rows="3" placeholder="Type a test message..."></textarea>
+                        <small class="form-help">Send a message to your configured Telegram channel at any time.</small>
+                    </div>
+                    <div class="d-flex gap-2">
+                        <button type="button" class="btn btn-outline-primary btn-sm" id="btnSendTelegramTest">
+                            <i class="fas fa-paper-plane me-1"></i>Send Test Message
+                        </button>
+                        <div id="telegramTestResult" class="small text-muted align-self-center"></div>
+                    </div>
+                    <div class="d-flex gap-2 mt-2">
+                        <button type="button" class="btn btn-outline-success btn-sm" id="btnSendSampleSignal">
+                            <i class="fas fa-bolt me-1"></i>Send Sample Live Signal
+                        </button>
+                        <div id="telegramSignalResult" class="small text-muted align-self-center"></div>
+                    </div>
+                </div>
+            </div>
         </div>
     </div>
 </div>
@@ -161,6 +250,9 @@
         $('#btnExportConfig').on('click', exportConfig);
         $('#btnImportConfig').on('click', function() { $('#importConfigFile').trigger('click'); });
         $('#importConfigFile').on('change', importConfigFromFile);
+        $('#btnSendTelegramTest').on('click', sendTelegramTest);
+        $('#btnSendSampleSignal').on('click', sendSampleSignal);
+        $('#btnStrikePreview').on('click', loadStrikePreview);
     });
 
     function loadStockOptions() {
@@ -177,6 +269,11 @@
             availableStocks.forEach(function(symbol) {
                 select.append('<option value=\"' + symbol + '\">' + symbol + '</option>');
                 multi.append('<option value=\"' + symbol + '\">' + symbol + '</option>');
+            });
+            const previewSelect = $('#strikePreviewSymbol');
+            previewSelect.empty();
+            availableStocks.forEach(function(symbol) {
+                previewSelect.append('<option value=\"' + symbol + '\">' + symbol + '</option>');
             });
         });
     }
@@ -212,10 +309,10 @@
                     $('#stockMode').val('all');
                 }
                 toggleStockMode();
-                $('#strikeRange').val(cfg.strikeRange || 5);
+                $('#strikeRange').val((cfg.strikeRange ?? 0));
                 $('#priceMultiplier').val(cfg.priceMultiplier || 2);
-                $('#timeframe').val(cfg.timeframe || 5);
-                $('#refreshInterval').val(cfg.refreshInterval || 5);
+                $('#timeframe').val(cfg.timeframe || 15);
+                $('#refreshInterval').val(cfg.refreshInterval || 15);
                 $('#scanProfile').val(cfg.scanProfile || 'balanced');
                 $('#workersCap').val(cfg.workers || 8);
                 $('#autoTune').prop('checked', cfg.autoTune !== false);
@@ -223,6 +320,12 @@
                 $('#livePrefilterTopMovers').val(cfg.livePrefilterTopMovers || 30);
                 $('#livePrefilterTopVolume').val(cfg.livePrefilterTopVolume || 30);
                 $('#livePrefilterMaxStocks').val(cfg.livePrefilterMaxStocks || 50);
+                $('#backtestRebalanceFrequency').val(cfg.backtestRebalanceFrequency || 'weekly');
+                $('#backtestStrictFirstCandle').prop('checked', cfg.backtestStrictFirstCandle !== false);
+                $('#backtestLiquidityFilterEnabled').prop('checked', cfg.backtestLiquidityFilterEnabled !== false);
+                $('#backtestMinCandlesPerStrike').val(cfg.backtestMinCandlesPerStrike || 5);
+                $('#backtestMinAvgVolume').val(cfg.backtestMinAvgVolume || 1);
+                $('#notificationServicesEnabled').prop('checked', cfg.notificationServicesEnabled !== false);
                 $('#guardrailEnabled').prop('checked', cfg.guardrailEnabled !== false);
                 $('#guardrailLoadThreshold').val(cfg.guardrailLoadThreshold || 1200);
             }
@@ -263,6 +366,12 @@
             livePrefilterTopMovers: $('#livePrefilterTopMovers').val(),
             livePrefilterTopVolume: $('#livePrefilterTopVolume').val(),
             livePrefilterMaxStocks: $('#livePrefilterMaxStocks').val(),
+            backtestRebalanceFrequency: $('#backtestRebalanceFrequency').val(),
+            backtestStrictFirstCandle: $('#backtestStrictFirstCandle').is(':checked'),
+            backtestLiquidityFilterEnabled: $('#backtestLiquidityFilterEnabled').is(':checked'),
+            backtestMinCandlesPerStrike: $('#backtestMinCandlesPerStrike').val(),
+            backtestMinAvgVolume: $('#backtestMinAvgVolume').val(),
+            notificationServicesEnabled: $('#notificationServicesEnabled').is(':checked'),
             guardrailEnabled: $('#guardrailEnabled').is(':checked'),
             guardrailLoadThreshold: $('#guardrailLoadThreshold').val()
         };
@@ -356,6 +465,123 @@
             $('#configResult').removeClass('text-muted text-success').addClass('text-danger').text('Unable to read file.');
         };
         reader.readAsText(file);
+    }
+
+    function sendTelegramTest() {
+        const text = String($('#telegramTestMessage').val() || '').trim();
+        const payload = { text: text };
+        $('#telegramTestResult').removeClass('text-success text-danger').addClass('text-muted').text('Sending...');
+        $.ajax({
+            url: '/scanner/api/test-telegram',
+            method: 'POST',
+            contentType: 'application/json',
+            data: JSON.stringify(payload),
+            headers: { 'X-CSRFToken': '{{ csrf_token() }}' },
+            success: function(response) {
+                if (response && response.success) {
+                    $('#telegramTestResult').removeClass('text-muted text-danger').addClass('text-success').text('Sent.');
+                } else {
+                    let reason = response && response.reason ? response.reason : 'Failed to send.';
+                    if (response && response.detail) {
+                        const detail = response.detail.description || response.detail.message || response.detail.error;
+                        if (detail) {
+                            reason += ' (' + detail + ')';
+                        }
+                    }
+                    $('#telegramTestResult').removeClass('text-muted text-success').addClass('text-danger').text(reason);
+                }
+            },
+            error: function(xhr) {
+                let reason = 'Failed to send.';
+                if (xhr.responseJSON && xhr.responseJSON.reason) {
+                    reason = xhr.responseJSON.reason;
+                    const detail = xhr.responseJSON.detail && (xhr.responseJSON.detail.description || xhr.responseJSON.detail.message || xhr.responseJSON.detail.error);
+                    if (detail) {
+                        reason += ' (' + detail + ')';
+                    }
+                } else if (xhr.status) {
+                    reason = 'HTTP ' + xhr.status + (xhr.statusText ? ' ' + xhr.statusText : '');
+                }
+                $('#telegramTestResult').removeClass('text-muted text-success').addClass('text-danger').text(reason);
+            }
+        });
+    }
+
+    function sendSampleSignal() {
+        $('#telegramSignalResult').removeClass('text-success text-danger').addClass('text-muted').text('Sending...');
+        $.ajax({
+            url: '/scanner/api/test-telegram-signal',
+            method: 'POST',
+            contentType: 'application/json',
+            data: JSON.stringify({}),
+            headers: { 'X-CSRFToken': '{{ csrf_token() }}' },
+            success: function(response) {
+                if (response && response.success) {
+                    $('#telegramSignalResult').removeClass('text-muted text-danger').addClass('text-success').text('Sent sample live signal.');
+                } else {
+                    const reason = response && response.reason ? response.reason : 'Failed to send sample signal.';
+                    $('#telegramSignalResult').removeClass('text-muted text-success').addClass('text-danger').text(reason);
+                }
+            },
+            error: function(xhr) {
+                const reason = xhr.responseJSON && xhr.responseJSON.reason ? xhr.responseJSON.reason : 'Failed to send sample signal.';
+                $('#telegramSignalResult').removeClass('text-muted text-success').addClass('text-danger').text(reason);
+            }
+        });
+    }
+
+    function loadStrikePreview() {
+        const symbol = String($('#strikePreviewSymbol').val() || '').trim();
+        const cmpVal = Number($('#strikePreviewCmp').val());
+        const strikeRange = Number($('#strikeRange').val() || 0);
+        if (!symbol) {
+            $('#strikePreviewResult').removeClass('text-success text-muted').addClass('text-danger').text('Select a symbol.');
+            return;
+        }
+        if (!isFinite(cmpVal) || cmpVal <= 0) {
+            $('#strikePreviewResult').removeClass('text-success text-muted').addClass('text-danger').text('Enter CMP (spot price).');
+            return;
+        }
+        $('#strikePreviewResult').removeClass('text-success text-danger').addClass('text-muted').text('Loading preview...');
+        $.ajax({
+            url: '/scanner/api/strike-preview',
+            method: 'POST',
+            contentType: 'application/json',
+            data: JSON.stringify({
+                symbol: symbol,
+                cmp: cmpVal,
+                strikeRange: strikeRange,
+                maxPreview: 20
+            }),
+            headers: { 'X-CSRFToken': '{{ csrf_token() }}' },
+            success: function(response) {
+                if (!response || !response.success) {
+                    const err = response && response.error ? response.error : 'Preview failed.';
+                    $('#strikePreviewResult').removeClass('text-muted text-success').addClass('text-danger').text(err);
+                    return;
+                }
+                const ce = (response.preview && response.preview.ce) ? response.preview.ce : [];
+                const pe = (response.preview && response.preview.pe) ? response.preview.pe : [];
+                const ceTotal = response.totals ? response.totals.ce : ce.length;
+                const peTotal = response.totals ? response.totals.pe : pe.length;
+                const ceNote = response.truncated && response.truncated.ce ? ' (preview)' : '';
+                const peNote = response.truncated && response.truncated.pe ? ' (preview)' : '';
+                const text =
+                    'Expiry: ' + response.expiry + ' | Step: ' + response.strikeStep + '\n' +
+                    'CE strikes (' + ceTotal + ceNote + '): ' + (ce.length ? ce.join(', ') : '-') + '\n' +
+                    'PE strikes (' + peTotal + peNote + '): ' + (pe.length ? pe.join(', ') : '-');
+                $('#strikePreviewResult').removeClass('text-muted text-danger').addClass('text-success').text(text);
+            },
+            error: function(xhr) {
+                let err = 'Preview failed.';
+                if (xhr.responseJSON && xhr.responseJSON.error) {
+                    err = xhr.responseJSON.error;
+                } else if (xhr.status) {
+                    err = 'HTTP ' + xhr.status + (xhr.statusText ? ' ' + xhr.statusText : '');
+                }
+                $('#strikePreviewResult').removeClass('text-muted text-success').addClass('text-danger').text(err);
+            }
+        });
     }
 </script>
 {% endblock %}
