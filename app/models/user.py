@@ -36,6 +36,8 @@ class User(UserMixin, db.Model):
     backtest_scan_log_enabled = db.Column(db.Boolean, nullable=False, default=False)
     api_error_log_enabled = db.Column(db.Boolean, nullable=False, default=False)
     notification_services_enabled = db.Column(db.Boolean, nullable=False, default=True)
+    telegram_bot_token = db.Column(db.String(255))
+    telegram_channel_id = db.Column(db.String(64))
     notification_sound_enabled = db.Column(db.Boolean, default=True)
     notification_sound_source = db.Column(db.String(20), default='beep')
     notification_sound_data = db.Column(db.Text)

@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from threading import Lock
 from threading import Thread
 import os
+import uuid
 from app import socketio, db
 from app.models.api_credential import APICredential
 from app.models.scanner_config import ScannerConfig
@@ -12,6 +13,10 @@ from app.models.signal import Signal
 from app.models.user import User
 from app.services.angel_api import AngelOneAPI
 from app.services.scanner_engine import ScannerEngine
+from app.services.telegram_notifier import send_signal_notification
+from app.services.streaming_manager import start_live_stream, stop_live_stream
+from app.services.queue_manager import get_queue, clear_live_stop_flag, set_live_stop_flag
+from app.services.live_scan_jobs import scan_live_symbol_job
 from app.utils.encryption import EncryptionHelper
 import logging
 
@@ -201,6 +206,7 @@ def _get_user_default_config_payload(user_id):
     return {
         'stockSelection': cfg.get_stock_selection() or 'all',
         'strikeRange': int(cfg.strike_range) if cfg.strike_range is not None else 0,
+        'liveExcludeAtmStrikes': int(cfg.live_exclude_atm_strikes or 0),
         'priceMultiplier': float(cfg.price_multiplier or 2.0),
         'timeframe': int(timeframe_text.replace('min', '') or 5),
         'refreshInterval': max(1, int((cfg.refresh_interval or 300) / 60))
@@ -220,6 +226,7 @@ def _build_scanner_config(user_id, config_data, mode):
     stock_selection = _pick_config_value(config_data, user_defaults, 'stockSelection', 'all')
     default_strike_range = 0
     strike_range = int(_pick_config_value(config_data, user_defaults, 'strikeRange', default_strike_range))
+    exclude_atm = _safe_int(_pick_config_value(config_data, user_defaults, 'liveExcludeAtmStrikes', 0), 0)
     price_multiplier = float(_pick_config_value(config_data, user_defaults, 'priceMultiplier', 2.0))
     timeframe = int(_pick_config_value(config_data, user_defaults, 'timeframe', 15))
     allowed_timeframes = {1, 3, 5, 15, 30, 60}
@@ -234,6 +241,7 @@ def _build_scanner_config(user_id, config_data, mode):
         config_name=config_name,
         stock_selection=stock_selection,
         strike_range=strike_range,
+        live_exclude_atm_strikes=max(0, min(10, exclude_atm)),
         price_multiplier=price_multiplier,
         timeframe=f'{timeframe}min',
         refresh_interval=refresh_interval,
@@ -496,6 +504,9 @@ def start_live_scan(app, user_id, config_data):
         scripts_total = int(len(selected_expiries or {}))
         engine.last_cycle_stocks_total = scripts_total
 
+        clear_live_stop_flag(user_id)
+        _start_streaming_for_live(user_id, engine, angel_api)
+
         with _lock:
             previous_status = dict(_scanner_status.get(user_id) or {})
             _live_scanners[user_id] = engine
@@ -555,12 +566,36 @@ def stop_live_scan(user_id):
         if engine:
             engine.stop_live_scan()
             _live_scanners.pop(user_id, None)
+            set_live_stop_flag(user_id)
+            stop_live_stream(user_id)
         elif not status or not status.get('running'):
             return False, 'No running scanner found.'
         if status:
             status['running'] = False
             status['stopped_at'] = datetime.utcnow().isoformat() + 'Z'
     return True, 'Scanner stopped.'
+
+
+def _start_streaming_for_live(user_id, engine, angel_api):
+    try:
+        enabled = str(os.getenv('LIVE_STREAMING_ENABLED', 'false')).strip().lower() in ('1', 'true', 'yes', 'on')
+        if not enabled:
+            return
+        exchange_type = int(os.getenv('LIVE_STREAMING_EXCHANGE_TYPE', '2') or 2)
+        tokens = []
+        symbols = engine._resolve_stock_selection()
+        ref = datetime.now()
+        for symbol in symbols:
+            expiry = engine._resolve_expiry(symbol, reference_date=ref)
+            if not expiry:
+                continue
+            tokens.extend(angel_api.get_option_tokens_for_expiry(symbol, expiry, exchange='NFO'))
+        tokens = list(dict.fromkeys(tokens))
+        if not tokens:
+            return
+        start_live_stream(user_id, angel_api, {exchange_type: tokens})
+    except Exception as exc:
+        logger.warning('Live streaming start failed: %s', str(exc))
 
 
 def start_backtest(app, user_id, config_data):
@@ -999,3 +1034,71 @@ def get_backtest_status(user_id):
                 _safe_int(getattr(engine, 'last_backtest_instruments_missing', 0))
             )
         return status
+
+
+def trigger_webhook_scan(app, user_id, symbol, timeframe=None, candle_time=None, strike_range=None):
+    job_id = uuid.uuid4().hex[:12]
+
+    def _run():
+        with app.app_context():
+            user = User.query.get(user_id)
+            if not user:
+                logger.warning('Webhook scan user not found: %s', user_id)
+                return
+
+            creds = APICredential.query.filter_by(user_id=user_id).first()
+            if not creds:
+                logger.warning('Webhook scan missing API credentials for user %s', user_id)
+                return
+
+            angel_api, error = _build_angel_api(creds, mode='live', totp_code=None)
+            if not angel_api:
+                logger.warning('Webhook scan auth failed for user %s: %s', user_id, error)
+                return
+            _store_tokens(creds, angel_api)
+
+            if not angel_api.load_scrip_master():
+                logger.warning('Webhook scan missing scrip master for user %s', user_id)
+                return
+
+            cfg_payload = _get_user_default_config_payload(user_id)
+            cfg_payload['stockSelection'] = str(symbol or '').strip().upper()
+            if timeframe:
+                cfg_payload['timeframe'] = _timeframe_minutes(timeframe, cfg_payload.get('timeframe', 15))
+            if strike_range is not None and str(strike_range).strip() != '':
+                cfg_payload['strikeRange'] = max(0, min(50, _safe_int(strike_range, 0)))
+
+            config = _build_scanner_config(user_id, cfg_payload, mode='live')
+            engine = ScannerEngine(
+                user_id=user_id,
+                config=config,
+                angel_api=angel_api,
+                workers=1,
+                live_prefilter_enabled=False,
+                live_prefilter_top_movers=0,
+                live_prefilter_top_volume=0,
+                live_prefilter_max_stocks=1,
+                api_error_log_enabled=bool(getattr(user, 'api_error_log_enabled', False))
+            )
+            engine.is_running = True
+            try:
+                signals = engine.scan_once(reference_time=_parse_iso_utc(candle_time))
+            except Exception as e:
+                logger.error('Webhook scan failed for user %s: %s', user_id, str(e))
+                return
+            finally:
+                engine.is_running = False
+
+            if signals:
+                for signal in signals:
+                    payload = engine._serialize_realtime_signal(signal)
+                    socketio.emit('new_signal', payload, to=f'user_{user_id}')
+                    send_signal_notification(payload, mode='live', user_id=user_id)
+
+            logger.info(
+                'Webhook scan complete user=%s symbol=%s signals=%s',
+                user_id, str(symbol or '').upper(), len(signals or [])
+            )
+
+    Thread(target=_run, daemon=True, name=f'webhook-scan-{user_id}-{job_id}').start()
+    return True, 'Webhook scan queued.', job_id

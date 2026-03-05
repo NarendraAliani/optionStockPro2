@@ -16,6 +16,7 @@ class Signal(db.Model):
     symbol = db.Column(db.String(50), nullable=False, index=True)
     option_type = db.Column(db.Enum('CE', 'PE'), nullable=False)
     strike_price = db.Column(db.Numeric(10, 2), nullable=False)
+    spot_price = db.Column(db.Numeric(10, 2))
     expiry_date = db.Column(db.Date, nullable=False)
     entry_price = db.Column(db.Numeric(10, 2), nullable=False)
     current_price = db.Column(db.Numeric(10, 2), nullable=False)
@@ -41,6 +42,7 @@ class Signal(db.Model):
             'symbol': self.symbol,
             'option_type': self.option_type,
             'strike_price': float(self.strike_price),
+            'spot_price': float(self.spot_price) if self.spot_price is not None else None,
             'expiry_date': self.expiry_date.isoformat(),
             'entry_price': float(self.entry_price),
             'current_price': float(self.current_price),

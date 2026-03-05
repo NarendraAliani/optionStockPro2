@@ -103,4 +103,5 @@ class SignalDetector:
             set(candidates),
             key=lambda strike: (abs(strike - spot_price), strike)
         )
-        return candidates[:strike_count]
+        # strike_range means strikes above/below ATM, so total = (2 * strike_count + 1).
+        return candidates[: (strike_count * 2 + 1)]

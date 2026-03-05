@@ -99,12 +99,14 @@ def create_app(config_name='default'):
     from app.routes.scanner import scanner_bp
     from app.routes.settings import settings_bp
     from app.routes.api import api_bp
+    from app.routes.webhooks import webhooks_bp
     
     app.register_blueprint(auth_bp, url_prefix='/auth')
     app.register_blueprint(dashboard_bp, url_prefix='/dashboard')
     app.register_blueprint(scanner_bp, url_prefix='/scanner')
     app.register_blueprint(settings_bp, url_prefix='/settings')
     app.register_blueprint(api_bp, url_prefix='/api')
+    app.register_blueprint(webhooks_bp, url_prefix='/webhooks')
     
     # Root route
     from flask import redirect, url_for
@@ -129,6 +131,7 @@ def create_app(config_name='default'):
         app.logger.setLevel(logging.INFO)
         app.logger.info('Options Signal Scanner Pro startup')
 
+    _check_redis_health(app)
     _start_scrip_master_scheduler(app)
     
     return app
@@ -161,6 +164,22 @@ def _start_scrip_master_scheduler(app):
 
     scheduler.start()
     app.extensions['scrip_master_scheduler'] = scheduler
+
+
+def _check_redis_health(app):
+    redis_url = os.getenv('REDIS_URL', '').strip()
+    if not redis_url:
+        app.logger.info('Redis health check skipped (REDIS_URL not set).')
+        return
+    try:
+        from app.services.queue_manager import get_redis_conn
+        conn = get_redis_conn()
+        if conn:
+            app.logger.info('Redis health check OK.')
+        else:
+            app.logger.warning('Redis health check failed.')
+    except Exception as exc:
+        app.logger.warning('Redis health check error: %s', str(exc))
 
 
 def _refresh_scrip_master(app):

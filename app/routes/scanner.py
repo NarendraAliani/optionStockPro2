@@ -46,6 +46,7 @@ def _default_config_payload():
     return {
         'stockSelection': 'all',
         'strikeRange': 0,
+        'liveExcludeAtmStrikes': 0,
         'priceMultiplier': 2.0,
         'timeframe': 15,
         'refreshInterval': 15,
@@ -152,6 +153,15 @@ def _normalize_config_payload(data):
     except Exception:
         pass
     try:
+        payload['liveExcludeAtmStrikes'] = _clamp_int(
+            data.get('liveExcludeAtmStrikes', payload.get('liveExcludeAtmStrikes', 0)),
+            0,
+            10,
+            0
+        )
+    except Exception:
+        pass
+    try:
         payload['priceMultiplier'] = max(1.0, float(data.get('priceMultiplier', payload['priceMultiplier'])))
     except Exception:
         pass
@@ -249,6 +259,7 @@ def _get_user_default_config(user_id):
     return {
         'stockSelection': stock_selection if stock_selection else 'all',
         'strikeRange': int(cfg.strike_range) if cfg.strike_range is not None else 0,
+        'liveExcludeAtmStrikes': int(cfg.live_exclude_atm_strikes or 0),
         'priceMultiplier': float(cfg.price_multiplier or 2.0),
         'timeframe': int(str(cfg.timeframe or '5').replace('min', '')),
         'refreshInterval': max(1, int((cfg.refresh_interval or 300) / 60)),
@@ -270,9 +281,27 @@ def get_scanner_config():
     cfg = _get_user_default_config(current_user.id)
     default_cfg = _default_config_payload()
     default_cfg.update(_user_runtime_defaults())
+    config = cfg or default_cfg
+    try:
+        from app.services.telegram_notifier import get_telegram_notifier
+        notifier = get_telegram_notifier()
+        token_effective, channel_effective = notifier.resolve_credentials(current_user.id)
+        config.update({
+            'telegramBotToken': str(getattr(current_user, 'telegram_bot_token', '') or ''),
+            'telegramChannelId': str(getattr(current_user, 'telegram_channel_id', '') or ''),
+            'telegramBotTokenPlaceholder': token_effective or '',
+            'telegramChannelIdPlaceholder': channel_effective or ''
+        })
+    except Exception:
+        config.update({
+            'telegramBotToken': '',
+            'telegramChannelId': '',
+            'telegramBotTokenPlaceholder': '',
+            'telegramChannelIdPlaceholder': ''
+        })
     return jsonify({
         'success': True,
-        'config': cfg or default_cfg
+        'config': config
     })
 
 
@@ -313,7 +342,8 @@ def get_stock_options():
 @login_required
 def save_scanner_config():
     """Save default scanner config for current user."""
-    payload = _normalize_config_payload(request.get_json() or {})
+    raw_payload = request.get_json() or {}
+    payload = _normalize_config_payload(raw_payload)
     cfg = ScannerConfig.query.filter_by(user_id=current_user.id, is_default=True).first()
     if not cfg:
         cfg = ScannerConfig(
@@ -325,6 +355,7 @@ def save_scanner_config():
 
     cfg.stock_selection = payload['stockSelection']
     cfg.strike_range = payload['strikeRange']
+    cfg.live_exclude_atm_strikes = _clamp_int(payload.get('liveExcludeAtmStrikes', 0), 0, 10, 0)
     cfg.price_multiplier = payload['priceMultiplier']
     cfg.timeframe = f"{payload['timeframe']}min"
     cfg.refresh_interval = payload['refreshInterval'] * 60
@@ -347,6 +378,10 @@ def save_scanner_config():
     current_user.guardrail_enabled = _coerce_bool(payload.get('guardrailEnabled'), default=True)
     current_user.guardrail_load_threshold = _clamp_int(payload.get('guardrailLoadThreshold', 1200), 100, 25000, 1200)
     current_user.notification_services_enabled = _coerce_bool(payload.get('notificationServicesEnabled'), default=True)
+    token = str(raw_payload.get('telegramBotToken') or '').strip()
+    channel_id = str(raw_payload.get('telegramChannelId') or '').strip()
+    current_user.telegram_bot_token = token or None
+    current_user.telegram_channel_id = channel_id or None
 
     db.session.commit()
     try:
@@ -394,6 +429,7 @@ def import_scanner_config():
 
     cfg.stock_selection = payload['stockSelection']
     cfg.strike_range = payload['strikeRange']
+    cfg.live_exclude_atm_strikes = _clamp_int(payload.get('liveExcludeAtmStrikes', 0), 0, 10, 0)
     cfg.price_multiplier = payload['priceMultiplier']
     cfg.timeframe = f"{payload['timeframe']}min"
     cfg.refresh_interval = payload['refreshInterval'] * 60
@@ -415,6 +451,12 @@ def import_scanner_config():
     current_user.guardrail_enabled = _coerce_bool(payload.get('guardrailEnabled'), default=True)
     current_user.guardrail_load_threshold = _clamp_int(payload.get('guardrailLoadThreshold', 1200), 100, 25000, 1200)
     current_user.notification_services_enabled = _coerce_bool(payload.get('notificationServicesEnabled'), default=True)
+    if isinstance(cfg_payload, dict):
+        token = str(cfg_payload.get('telegramBotToken') or '').strip()
+        channel_id = str(cfg_payload.get('telegramChannelId') or '').strip()
+        if token or channel_id:
+            current_user.telegram_bot_token = token or None
+            current_user.telegram_channel_id = channel_id or None
 
     db.session.commit()
     try:
@@ -599,12 +641,12 @@ def test_telegram():
         notifier = get_telegram_notifier()
         ok, reason, detail = send_test_notification(text, user_id=current_user.id)
         status = 200 if ok else 400
-        token = notifier.bot_token or ''
+        token, channel = notifier.resolve_credentials(current_user.id)
         diag = {
             'enabled': bool(getattr(notifier, 'enabled', False)),
-            'active': bool(notifier.is_active()),
+            'active': bool(notifier.is_active_for_user(current_user.id)),
             'live_only': bool(getattr(notifier, 'live_only', False)),
-            'channel_id': notifier.channel_id or None,
+            'channel_id': channel or None,
             'token_suffix': token[-4:] if len(token) >= 4 else None,
             'notification_services_enabled': bool(getattr(current_user, 'notification_services_enabled', True))
         }
@@ -612,6 +654,37 @@ def test_telegram():
             'success': bool(ok),
             'reason': reason,
             'detail': detail,
+            'diag': diag
+        }), status
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'reason': f'exception:{str(e)}',
+            'detail': None
+        }), 500
+
+
+@scanner_bp.route('/api/telegram-diagnostics', methods=['POST'])
+@login_required
+def telegram_diagnostics():
+    try:
+        from app.services.telegram_notifier import get_telegram_notifier
+        notifier = get_telegram_notifier()
+        token, channel = notifier.resolve_credentials(current_user.id)
+        reason = 'ok' if notifier.is_active_for_user(current_user.id) else 'telegram_disabled_or_unconfigured'
+        diag = {
+            'enabled': bool(getattr(notifier, 'enabled', False)),
+            'active': bool(notifier.is_active_for_user(current_user.id)),
+            'live_only': bool(getattr(notifier, 'live_only', False)),
+            'channel_id': channel or None,
+            'token_suffix': token[-4:] if len(token) >= 4 else None,
+            'notification_services_enabled': bool(getattr(current_user, 'notification_services_enabled', True))
+        }
+        status = 200 if diag['active'] else 400
+        return jsonify({
+            'success': bool(diag['active']),
+            'reason': reason,
+            'detail': None,
             'diag': diag
         }), status
     except Exception as e:
@@ -646,11 +719,11 @@ def test_telegram_signal():
         from app.services.telegram_notifier import get_telegram_notifier
         notifier = get_telegram_notifier()
         ok, reason = notifier.notify_signal(sample, mode='live', user_id=current_user.id)
-        token = notifier.bot_token or ''
+        token, channel = notifier.resolve_credentials(current_user.id)
         diag = {
-            'active': bool(notifier.is_active()),
+            'active': bool(notifier.is_active_for_user(current_user.id)),
             'live_only': bool(getattr(notifier, 'live_only', False)),
-            'channel_id': notifier.channel_id or None,
+            'channel_id': channel or None,
             'token_suffix': token[-4:] if len(token) >= 4 else None,
             'notification_services_enabled': bool(getattr(current_user, 'notification_services_enabled', True))
         }

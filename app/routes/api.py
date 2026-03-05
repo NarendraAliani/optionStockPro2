@@ -241,12 +241,39 @@ def health_check():
     except Exception as e:
         db_status = f'error: {str(e)}'
 
+    redis_status = 'disabled'
+    redis_url = str(os.getenv('REDIS_URL', '') or '').strip()
+    if redis_url:
+        try:
+            from app.services.queue_manager import get_redis_conn
+            conn = get_redis_conn()
+            redis_status = 'ok' if conn else 'error'
+        except Exception as e:
+            redis_status = f'error: {str(e)}'
+
+    worker_status = 'disabled'
+    worker_count = 0
+    if redis_status == 'ok':
+        try:
+            from rq import Worker
+            from app.services.queue_manager import get_redis_conn
+            conn = get_redis_conn()
+            if conn:
+                workers = Worker.all(connection=conn)
+                worker_count = len(workers or [])
+                worker_status = 'ok' if worker_count > 0 else 'idle'
+        except Exception as e:
+            worker_status = f'error: {str(e)}'
+
     status = 'ok' if db_status == 'ok' else 'degraded'
     code = 200 if status == 'ok' else 503
 
     return jsonify({
         'status': status,
         'db': db_status,
+        'redis': redis_status,
+        'worker_status': worker_status,
+        'worker_count': worker_count,
         'timestamp': datetime.utcnow().isoformat() + 'Z'
     }), code
 
@@ -396,7 +423,7 @@ def export_signals_csv():
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow([
-        'Time', 'Stock', 'Strike', 'Type',
+        'Time', 'Stock', 'CMP', 'Strike', 'Type',
         'Prev Close (Entry Basis)', 'Signal Close (Current)',
         'Open', 'High', 'Low', 'Close',
         'Vol', 'RSI', '% Change', 'Status', 'Displayed At'
@@ -406,6 +433,7 @@ def export_signals_csv():
         writer.writerow([
             _format_ist_datetime(row.get('detected_at', '')),
             _format_contract_symbol(row.get('symbol', '')),
+            _format_number_2dp(row.get('spot_price', '')),
             _format_strike_csv(row.get('strike_price', '')),
             row.get('option_type', ''),
             _format_number_2dp(row.get('entry_price', '')),

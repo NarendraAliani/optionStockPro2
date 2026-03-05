@@ -293,6 +293,15 @@ body {
     font-size: 0.8rem;
 }
 
+.status-badge-red {
+    background: rgba(248, 113, 113, 0.2);
+    color: #f87171;
+    padding: 0.25rem 0.6rem;
+    border-radius: 0.3rem;
+    font-weight: 600;
+    font-size: 0.8rem;
+}
+
 /* ============================================
    SIGNAL CARD SPECIAL
    ============================================ */

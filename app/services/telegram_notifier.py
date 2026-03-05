@@ -104,24 +104,55 @@ class TelegramNotifier:
     def is_active(self) -> bool:
         return bool(self.enabled and self.bot_token and self.channel_id)
 
+    def resolve_credentials(self, user_id: Optional[int] = None) -> Tuple[str, str]:
+        bot_token = self.bot_token
+        channel_id = self.channel_id
+
+        if has_app_context() and isinstance(user_id, int):
+            try:
+                from app.models.user import User
+                user = User.query.get(int(user_id))
+                if user is not None:
+                    token_override = str(getattr(user, 'telegram_bot_token', '') or '').strip()
+                    channel_override = str(getattr(user, 'telegram_channel_id', '') or '').strip()
+                    if token_override:
+                        bot_token = token_override
+                    if channel_override:
+                        channel_id = channel_override
+            except Exception:
+                pass
+
+        return bot_token, channel_id
+
+    def is_active_for_user(self, user_id: Optional[int] = None) -> bool:
+        if not self.enabled:
+            return False
+        bot_token, channel_id = self.resolve_credentials(user_id)
+        return bool(bot_token and channel_id)
+
     def notify_signal(self, signal: Dict[str, Any], mode: str = 'live', user_id: Optional[int] = None) -> Tuple[bool, str]:
         signal_mode = 'backtest' if str(mode or '').strip().lower() == 'backtest' else 'live'
-        if not self.is_active():
+        if not self.is_active_for_user(user_id):
             return False, 'telegram_disabled_or_unconfigured'
         if self.live_only and signal_mode != 'live':
             return False, 'telegram_live_only'
         if not self._user_notifications_enabled(user_id):
             return False, 'notification_services_disabled'
 
+        try:
+            detected_at = signal.get('detected_at')
+        except Exception:
+            detected_at = None
         message = self._build_message(signal or {}, signal_mode, user_id=user_id)
         key = self._cooldown_key(signal or {}, signal_mode, user_id=user_id)
         allowed, reason = self._allow_send(key)
         if not allowed:
             return False, reason
 
-        endpoint = f'https://api.telegram.org/bot{self.bot_token}/sendMessage'
+        bot_token, channel_id = self.resolve_credentials(user_id)
+        endpoint = f'https://api.telegram.org/bot{bot_token}/sendMessage'
         payload = {
-            'chat_id': self.channel_id,
+            'chat_id': channel_id,
             'text': message,
             'disable_web_page_preview': True
         }
@@ -136,6 +167,19 @@ class TelegramNotifier:
                     body = response.json() if response.content else {}
                     if bool(body.get('ok', False)):
                         self._mark_sent(key)
+                        try:
+                            stamp = datetime.utcnow().isoformat() + 'Z'
+                            logger.info(
+                                'Telegram sent at %s mode=%s user=%s symbol=%s strike=%s detected_at=%s',
+                                stamp,
+                                signal_mode,
+                                str(user_id),
+                                str(signal.get('symbol') or ''),
+                                str(signal.get('strike_price') or ''),
+                                str(detected_at or '')
+                            )
+                        except Exception:
+                            pass
                         return True, 'sent'
                     self._last_send_detail = {
                         'status_code': response.status_code,
@@ -240,6 +284,7 @@ class TelegramNotifier:
         timeframe = html_escape(str(signal.get('timeframe') or '-'))
         entry = html_escape(self._fmt_num(signal.get('entry_price')))
         current = html_escape(self._fmt_num(signal.get('current_price')))
+        spot = html_escape(self._fmt_num(signal.get('spot_price')))
         change_pct = html_escape(self._fmt_pct(signal.get('price_change_percent')))
         volume = html_escape(self._fmt_num(signal.get('volume')))
         rsi = html_escape(self._fmt_num(signal.get('rsi')))
@@ -253,6 +298,7 @@ class TelegramNotifier:
                 f'⏱ Timeframe: <b>{timeframe}</b>\n\n'
                 f'💰 Entry Zone: <b>{entry}</b>\n'
                 f'📈 LTP: <b>{current}</b>\n'
+                f'🎯 CMP: <b>{spot}</b>\n'
                 f'🚀 Move: <b>{change_pct}</b>\n\n'
                 f'📊 Volume: {volume}\n'
                 f'📉 RSI: {rsi}\n'
@@ -267,6 +313,7 @@ class TelegramNotifier:
             f'⏱ Timeframe: <b>{timeframe}</b>\n\n'
             f'💰 Entry Zone: <b>{entry}</b>\n'
             f'📈 LTP: <b>{current}</b>\n'
+            f'🎯 CMP: <b>{spot}</b>\n'
             f'🚀 Move: <b>{change_pct}</b>\n\n'
             f'📊 Volume: {volume}\n'
             f'📉 RSI: {rsi}\n'
@@ -281,6 +328,7 @@ class TelegramNotifier:
             f'🕒 Timeframe: {signal.get("timeframe", "-")}',
             f'💰 Entry: {self._fmt_num(signal.get("entry_price"))}',
             f'📈 Current: {self._fmt_num(signal.get("current_price"))}',
+            f'🎯 CMP: {self._fmt_num(signal.get("spot_price"))}',
             f'🔺 Change: {self._fmt_pct(signal.get("price_change_percent"))}',
             f'📊 Volume: {self._fmt_num(signal.get("volume"))}',
             f'📉 RSI: {self._fmt_num(signal.get("rsi"))}',
@@ -391,16 +439,17 @@ def send_test_notification(text: str, user_id: Optional[int] = None) -> Tuple[bo
     try:
         notifier = get_telegram_notifier()
         signal_mode = 'live'
-        if not notifier.is_active():
+        if not notifier.is_active_for_user(user_id):
             return False, 'telegram_disabled_or_unconfigured', None
         if notifier.live_only and signal_mode != 'live':
             return False, 'telegram_live_only', None
         if not notifier._user_notifications_enabled(user_id):
             return False, 'notification_services_disabled', None
 
-        endpoint = f'https://api.telegram.org/bot{notifier.bot_token}/sendMessage'
+        bot_token, channel_id = notifier.resolve_credentials(user_id)
+        endpoint = f'https://api.telegram.org/bot{bot_token}/sendMessage'
         payload = {
-            'chat_id': notifier.channel_id,
+            'chat_id': channel_id,
             'text': text,
             'disable_web_page_preview': True
         }

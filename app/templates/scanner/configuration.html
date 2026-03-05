@@ -45,6 +45,11 @@
                         <small class="form-help">Use 0 to scan all available strikes; 1+ scans nearest strikes only.</small>
                     </div>
                     <div class="form-group">
+                        <label class="form-label" for="liveExcludeAtmStrikes">Live: Exclude ATM Strikes</label>
+                        <input type="number" class="form-control" id="liveExcludeAtmStrikes" value="0" min="0" max="10">
+                        <small class="form-help">Live mode only. 0 disables. 3 excludes ATM and the next 3 strikes on both sides.</small>
+                    </div>
+                    <div class="form-group">
                         <label class="form-label" for="priceMultiplier">Price Multiplier</label>
                         <input type="number" class="form-control" id="priceMultiplier" value="2" min="1" max="10" step="0.1">
                         <small class="form-help">Signal threshold multiplier</small>
@@ -209,15 +214,31 @@
                 </div>
                 <div class="config-card-body">
                     <div class="form-group">
+                        <label class="form-label" for="telegramChannelId">Telegram Channel ID</label>
+                        <input type="text" class="form-control" id="telegramChannelId" placeholder="">
+                        <small class="form-help">Leave blank to use the server default channel ID.</small>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="telegramBotToken">Telegram Bot Token</label>
+                        <input type="text" class="form-control" id="telegramBotToken" placeholder="">
+                        <small class="form-help">Leave blank to use the server default bot token.</small>
+                    </div>
+                    <div class="form-group">
                         <label class="form-label" for="telegramTestMessage">Message</label>
                         <textarea class="form-control" id="telegramTestMessage" rows="3" placeholder="Type a test message..."></textarea>
-                        <small class="form-help">Send a message to your configured Telegram channel at any time.</small>
+                        <small class="form-help">Send a message to your configured Telegram channel at any time. Diagnostics only checks configuration and does not send.</small>
                     </div>
                     <div class="d-flex gap-2">
                         <button type="button" class="btn btn-outline-primary btn-sm" id="btnSendTelegramTest">
                             <i class="fas fa-paper-plane me-1"></i>Send Test Message
                         </button>
                         <div id="telegramTestResult" class="small text-muted align-self-center"></div>
+                    </div>
+                    <div class="d-flex gap-2 mt-2">
+                        <button type="button" class="btn btn-outline-warning btn-sm" id="btnTelegramDiagnostics">
+                            <i class="fas fa-stethoscope me-1"></i>Run Diagnostics
+                        </button>
+                        <div id="telegramDiagResult" class="small text-muted align-self-center"></div>
                     </div>
                     <div class="d-flex gap-2 mt-2">
                         <button type="button" class="btn btn-outline-success btn-sm" id="btnSendSampleSignal">
@@ -251,6 +272,7 @@
         $('#btnImportConfig').on('click', function() { $('#importConfigFile').trigger('click'); });
         $('#importConfigFile').on('change', importConfigFromFile);
         $('#btnSendTelegramTest').on('click', sendTelegramTest);
+        $('#btnTelegramDiagnostics').on('click', sendTelegramDiagnostics);
         $('#btnSendSampleSignal').on('click', sendSampleSignal);
         $('#btnStrikePreview').on('click', loadStrikePreview);
     });
@@ -310,6 +332,7 @@
                 }
                 toggleStockMode();
                 $('#strikeRange').val((cfg.strikeRange ?? 0));
+                $('#liveExcludeAtmStrikes').val((cfg.liveExcludeAtmStrikes ?? 0));
                 $('#priceMultiplier').val(cfg.priceMultiplier || 2);
                 $('#timeframe').val(cfg.timeframe || 15);
                 $('#refreshInterval').val(cfg.refreshInterval || 15);
@@ -328,6 +351,10 @@
                 $('#notificationServicesEnabled').prop('checked', cfg.notificationServicesEnabled !== false);
                 $('#guardrailEnabled').prop('checked', cfg.guardrailEnabled !== false);
                 $('#guardrailLoadThreshold').val(cfg.guardrailLoadThreshold || 1200);
+                $('#telegramChannelId').val(cfg.telegramChannelId || '');
+                $('#telegramBotToken').val(cfg.telegramBotToken || '');
+                $('#telegramChannelId').attr('placeholder', cfg.telegramChannelIdPlaceholder || '');
+                $('#telegramBotToken').attr('placeholder', cfg.telegramBotTokenPlaceholder || '');
             }
         });
     }
@@ -354,6 +381,7 @@
         const payload = {
             stockSelection: stockSelection,
             strikeRange: $('#strikeRange').val(),
+            liveExcludeAtmStrikes: $('#liveExcludeAtmStrikes').val(),
             priceMultiplier: $('#priceMultiplier').val(),
             timeframe: $('#timeframe').val(),
             refreshInterval: $('#refreshInterval').val(),
@@ -373,7 +401,9 @@
             backtestMinAvgVolume: $('#backtestMinAvgVolume').val(),
             notificationServicesEnabled: $('#notificationServicesEnabled').is(':checked'),
             guardrailEnabled: $('#guardrailEnabled').is(':checked'),
-            guardrailLoadThreshold: $('#guardrailLoadThreshold').val()
+            guardrailLoadThreshold: $('#guardrailLoadThreshold').val(),
+            telegramChannelId: String($('#telegramChannelId').val() || '').trim(),
+            telegramBotToken: String($('#telegramBotToken').val() || '').trim()
         };
 
         $('#configResult').removeClass('text-success text-danger').addClass('text-muted').text('Saving...');
@@ -526,6 +556,52 @@
             error: function(xhr) {
                 const reason = xhr.responseJSON && xhr.responseJSON.reason ? xhr.responseJSON.reason : 'Failed to send sample signal.';
                 $('#telegramSignalResult').removeClass('text-muted text-success').addClass('text-danger').text(reason);
+            }
+        });
+    }
+
+    function sendTelegramDiagnostics() {
+        const payload = {
+            text: String($('#telegramTestMessage').val() || '').trim()
+        };
+        $('#telegramDiagResult').removeClass('text-success text-danger').addClass('text-muted').text('Running...');
+        $.ajax({
+            url: '/scanner/api/telegram-diagnostics',
+            method: 'POST',
+            contentType: 'application/json',
+            data: JSON.stringify(payload),
+            headers: { 'X-CSRFToken': '{{ csrf_token() }}' },
+            success: function(response) {
+                const diag = response && response.diag ? response.diag : {};
+                const detail = response && response.detail ? response.detail : null;
+                let reason = response && response.reason ? response.reason : 'Failed.';
+                if (detail) {
+                    const detailMsg = detail.description || detail.message || detail.error;
+                    if (detailMsg) {
+                        reason += ' (' + detailMsg + ')';
+                    }
+                }
+                const summary =
+                    'enabled=' + (diag.enabled ? 'yes' : 'no') +
+                    ' active=' + (diag.active ? 'yes' : 'no') +
+                    ' live_only=' + (diag.live_only ? 'yes' : 'no') +
+                    ' channel=' + (diag.channel_id || '-') +
+                    ' token_suffix=' + (diag.token_suffix || '-') +
+                    ' user_notifs=' + (diag.notification_services_enabled ? 'yes' : 'no');
+                if (response && response.success) {
+                    $('#telegramDiagResult').removeClass('text-muted text-danger').addClass('text-success').text('OK. ' + summary);
+                } else {
+                    $('#telegramDiagResult').removeClass('text-muted text-success').addClass('text-danger').text(reason + ' | ' + summary);
+                }
+            },
+            error: function(xhr) {
+                let reason = 'Diagnostics failed.';
+                if (xhr.responseJSON && xhr.responseJSON.reason) {
+                    reason = xhr.responseJSON.reason;
+                } else if (xhr.status) {
+                    reason = 'HTTP ' + xhr.status + (xhr.statusText ? ' ' + xhr.statusText : '');
+                }
+                $('#telegramDiagResult').removeClass('text-muted text-success').addClass('text-danger').text(reason);
             }
         });
     }

@@ -16,6 +16,8 @@ class ScannerConfig(db.Model):
     stock_selection = db.Column(db.JSON)  # ["NIFTY", "BANKNIFTY"] or "ALL"
     # 0 means scan all available strikes from the NFO option universe.
     strike_range = db.Column(db.Integer, default=0)
+    # Live mode: exclude ATM and the next N strikes on each side.
+    live_exclude_atm_strikes = db.Column(db.Integer, default=0)
     price_multiplier = db.Column(db.Numeric(5, 2), default=2.00)
     timeframe = db.Column(db.String(10), default='5min')
     refresh_interval = db.Column(db.Integer, default=300)  # seconds

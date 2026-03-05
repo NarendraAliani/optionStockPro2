@@ -5,6 +5,7 @@ from app.services.angel_api import AngelOneAPI
 from app.services.signal_detector import SignalDetector
 from app.services.data_processor import DataProcessor
 from app.services.telegram_notifier import send_signal_notification
+from app.services.live_scan_jobs import scan_live_symbol_job
 from app.models.signal import Signal
 from app.models.signal_detail import SignalDetail
 from app import db, socketio
@@ -160,7 +161,11 @@ class ScannerEngine:
                     break
                 continue
             try:
-                signals = self.scan_once(progress_callback=status_callback, reference_time=candle_slot)
+                signals = self.scan_once(
+                    progress_callback=status_callback,
+                    reference_time=candle_slot,
+                    emit_signals=True
+                )
                 if status_callback:
                     status_callback(
                         self.user_id,
@@ -172,15 +177,6 @@ class ScannerEngine:
                         strikes_total=self.last_cycle_strikes_total,
                         skipped_candles=self.last_cycle_skipped_candles
                     )
-                if signals:
-                    for signal in signals:
-                        payload = self._serialize_realtime_signal(signal)
-                        socketio.emit(
-                            'new_signal',
-                            payload,
-                            to=f'user_{self.user_id}'
-                        )
-                        send_signal_notification(payload, mode='live', user_id=self.user_id)
                 self._log_api_activity('live')
             except Exception as e:
                 logger.error(f'Live scan error: {str(e)}')
@@ -194,7 +190,7 @@ class ScannerEngine:
             if self._wait_with_abort(refresh_interval):
                 break
 
-    def scan_once(self, progress_callback=None, reference_time=None):
+    def scan_once(self, progress_callback=None, reference_time=None, emit_signals=False):
         """Run a single live scan cycle and persist detected signals."""
         cycle_time = reference_time or datetime.now()
         self._refresh_daily_caches(cycle_time)
@@ -236,7 +232,13 @@ class ScannerEngine:
                 continue
 
             strikes_by_type = self._resolve_strikes_by_type(symbol, expiry, spot_ltp)
-            symbol_jobs.append({'symbol': symbol, 'expiry': expiry, 'strikes_by_type': strikes_by_type})
+            strikes_by_type = self._apply_live_strike_exclusions(symbol, spot_ltp, strikes_by_type)
+            symbol_jobs.append({
+                'symbol': symbol,
+                'expiry': expiry,
+                'strikes_by_type': strikes_by_type,
+                'spot_price': spot_ltp
+            })
 
         self.last_cycle_strikes_total = sum(
             len(job['strikes_by_type'].get('CE', [])) + len(job['strikes_by_type'].get('PE', []))
@@ -263,57 +265,149 @@ class ScannerEngine:
         if not symbol_jobs:
             return detected
 
-        executor = ThreadPoolExecutor(max_workers=self.max_workers)
-        aborted = False
-        try:
-            future_map = {
-                executor.submit(
-                    self._scan_live_symbol,
-                    job['symbol'],
-                    job['expiry'],
-                    job['strikes_by_type'],
-                    timeframe
-                ): job['symbol']
-                for job in symbol_jobs
-            }
-            for future in as_completed(future_map):
-                self.last_cycle_stocks_scanned += 1
-                symbol_detected = []
-                strikes_scanned = 0
-                skipped_candles = 0
-                try:
-                    result = future.result()
-                    if isinstance(result, tuple):
-                        symbol_detected = result[0] or []
-                        strikes_scanned = self._safe_int(result[1], 0) if len(result) > 1 else 0
-                        skipped_candles = self._safe_int(result[2], 0) if len(result) > 2 else 0
-                    else:
-                        symbol_detected = result or []
-                except Exception as e:
-                    logger.error('Live scan worker failed for %s: %s', future_map.get(future), str(e))
-                self.last_cycle_strikes_scanned += self._safe_int(strikes_scanned, 0)
-                self.last_cycle_skipped_candles += self._safe_int(skipped_candles, 0)
-                if symbol_detected:
-                    detected.extend(symbol_detected)
-                if progress_callback:
-                    progress_callback(
-                        self.user_id,
-                        stocks_scanned=self.last_cycle_stocks_scanned,
-                        stocks_total=self.last_cycle_stocks_total,
-                        strikes_scanned=self.last_cycle_strikes_scanned,
-                        strikes_total=self.last_cycle_strikes_total,
-                        skipped_candles=self.last_cycle_skipped_candles
-                    )
+        use_queue = str(os.getenv('LIVE_SCAN_USE_QUEUE', 'false')).strip().lower() in ('1', 'true', 'yes', 'on')
+        queue = None
+        if use_queue:
+            try:
+                from app.services.queue_manager import get_queue
+                queue = get_queue()
+            except Exception:
+                queue = None
+
+        if queue:
+            jobs = []
+            for job in symbol_jobs:
+                payload = {
+                    'user_id': self.user_id,
+                    'symbol': job['symbol'],
+                    'expiry': job['expiry'].isoformat() if hasattr(job['expiry'], 'isoformat') else job['expiry'],
+                    'strikes_by_type': job['strikes_by_type'],
+                    'timeframe': timeframe,
+                    'price_multiplier': float(self.config.price_multiplier or 0),
+                    'spot_price': job.get('spot_price')
+                }
+                jobs.append(queue.enqueue(scan_live_symbol_job, payload))
+
+            pending = set(jobs)
+            aborted = False
+            while pending:
+                finished = [job for job in list(pending) if job.is_finished or job.is_failed or job.is_stopped]
+                if not finished:
+                    if not self.is_running or self._stop_event.is_set():
+                        aborted = True
+                        break
+                    time.sleep(0.2)
+                    continue
+                for job in finished:
+                    pending.discard(job)
+                    self.last_cycle_stocks_scanned += 1
+                    symbol_detected = []
+                    strikes_scanned = 0
+                    skipped_candles = 0
+                    try:
+                        result = job.result or ()
+                        if isinstance(result, tuple):
+                            symbol_detected = result[0] or []
+                            strikes_scanned = self._safe_int(result[1], 0) if len(result) > 1 else 0
+                            skipped_candles = self._safe_int(result[2], 0) if len(result) > 2 else 0
+                        else:
+                            symbol_detected = result or []
+                    except Exception:
+                        pass
+                    self.last_cycle_strikes_scanned += self._safe_int(strikes_scanned, 0)
+                    self.last_cycle_skipped_candles += self._safe_int(skipped_candles, 0)
+                    if symbol_detected:
+                        for signal in symbol_detected:
+                            try:
+                                signal['strike_price'] = self._normalize_signal_strike(
+                                    signal.get('strike_price'),
+                                    signal.get('symbol')
+                                )
+                                candle_time = signal.get('detected_at')
+                                if self._is_new_live_candle_signal(signal.get('symbol'), candle_time):
+                                    detected.append(signal)
+                                    if emit_signals:
+                                        self._emit_live_signal(signal)
+                            except Exception:
+                                continue
+                    if progress_callback:
+                        progress_callback(
+                            self.user_id,
+                            stocks_scanned=self.last_cycle_stocks_scanned,
+                            stocks_total=self.last_cycle_stocks_total,
+                            strikes_scanned=self.last_cycle_strikes_scanned,
+                            strikes_total=self.last_cycle_strikes_total,
+                            skipped_candles=self.last_cycle_skipped_candles
+                        )
                 if not self.is_running or self._stop_event.is_set():
                     aborted = True
                     break
-        finally:
-            executor.shutdown(wait=not aborted, cancel_futures=aborted)
+            if aborted:
+                return detected
+        else:
+            executor = ThreadPoolExecutor(max_workers=self.max_workers)
+            aborted = False
+            try:
+                future_map = {
+                    executor.submit(
+                        self._scan_live_symbol,
+                        job['symbol'],
+                        job['expiry'],
+                        job['strikes_by_type'],
+                        timeframe,
+                        job.get('spot_price')
+                    ): job['symbol']
+                    for job in symbol_jobs
+                }
+                for future in as_completed(future_map):
+                    self.last_cycle_stocks_scanned += 1
+                    symbol_detected = []
+                    strikes_scanned = 0
+                    skipped_candles = 0
+                    try:
+                        result = future.result()
+                        if isinstance(result, tuple):
+                            symbol_detected = result[0] or []
+                            strikes_scanned = self._safe_int(result[1], 0) if len(result) > 1 else 0
+                            skipped_candles = self._safe_int(result[2], 0) if len(result) > 2 else 0
+                        else:
+                            symbol_detected = result or []
+                    except Exception as e:
+                        logger.error('Live scan worker failed for %s: %s', future_map.get(future), str(e))
+                    self.last_cycle_strikes_scanned += self._safe_int(strikes_scanned, 0)
+                    self.last_cycle_skipped_candles += self._safe_int(skipped_candles, 0)
+                    if symbol_detected:
+                        for signal in symbol_detected:
+                            detected.append(signal)
+                            if emit_signals:
+                                self._emit_live_signal(signal)
+                    if progress_callback:
+                        progress_callback(
+                            self.user_id,
+                            stocks_scanned=self.last_cycle_stocks_scanned,
+                            stocks_total=self.last_cycle_stocks_total,
+                            strikes_scanned=self.last_cycle_strikes_scanned,
+                            strikes_total=self.last_cycle_strikes_total,
+                            skipped_candles=self.last_cycle_skipped_candles
+                        )
+                    if not self.is_running or self._stop_event.is_set():
+                        aborted = True
+                        break
+            finally:
+                executor.shutdown(wait=not aborted, cancel_futures=aborted)
 
         if detected:
             self._persist_signals(detected, mode='live')
 
         return detected
+
+    def _emit_live_signal(self, signal):
+        try:
+            payload = self._serialize_realtime_signal(signal)
+            socketio.emit('new_signal', payload, to=f'user_{self.user_id}')
+            send_signal_notification(payload, mode='live', user_id=self.user_id)
+        except Exception:
+            pass
 
     def run_backtest(self, from_date, to_date, progress_callback=None):
         """
@@ -388,17 +482,7 @@ class ScannerEngine:
                 self.last_backtest_candles_missing += self._safe_int(symbol_candles_missing, 0)
 
                 if symbol_detected:
-                    self._persist_signals(symbol_detected, mode='backtest')
-                    self.last_backtest_signals += len(symbol_detected)
                     detected.extend(symbol_detected)
-                    for signal in symbol_detected:
-                        payload = self._serialize_realtime_signal(signal)
-                        socketio.emit(
-                            'new_signal',
-                            payload,
-                            to=f'user_{self.user_id}'
-                        )
-                        send_signal_notification(payload, mode='backtest', user_id=self.user_id)
                 self._log_api_activity('backtest')
 
                 if progress_callback:
@@ -434,7 +518,7 @@ class ScannerEngine:
 
         return detected
 
-    def _scan_live_symbol(self, symbol, expiry, strikes_by_type, timeframe):
+    def _scan_live_symbol(self, symbol, expiry, strikes_by_type, timeframe, spot_price=None):
         if not self.is_running or self._stop_event.is_set() or not expiry:
             return [], 0, 0
 
@@ -503,6 +587,8 @@ class ScannerEngine:
                 if not self._is_new_live_candle_signal(signal['symbol'], candle_time):
                     continue
                 signal['expiry_date'] = expiry
+                if spot_price is not None:
+                    signal['spot_price'] = float(spot_price)
                 signal['detected_at'] = candle_time or datetime.utcnow()
                 signal['displayed_at'] = datetime.utcnow()
                 symbol_detected.append(signal)
@@ -728,10 +814,15 @@ class ScannerEngine:
                             }
                         )
 
+                        interval_minutes = max(1, self._safe_int(timeframe, 5))
+                        fetch_from = window_from
+                        if self._backtest_strict_first_candle:
+                            # Include the immediate prior candle so day-1 close is available.
+                            fetch_from = window_from - timedelta(minutes=interval_minutes)
                         candles = self._get_historical_candles_cached(
                             instrument=instrument,
                             timeframe=timeframe,
-                            from_date=window_from,
+                            from_date=fetch_from,
                             to_date=window_to,
                             exchange='NFO'
                         )
@@ -934,9 +1025,22 @@ class ScannerEngine:
                                 signal.get('symbol')
                             )
                             signal['expiry_date'] = expiry
+                            if active_spot_ltp is not None:
+                                signal['spot_price'] = float(active_spot_ltp)
                             signal['detected_at'] = current_time
                             signal['displayed_at'] = datetime.utcnow()
                             signal['mode'] = 'backtest'
+
+                            # Persist and emit immediately for backtest.
+                            try:
+                                self._persist_signals([signal], mode='backtest')
+                                self.last_backtest_signals += 1
+                                payload = self._serialize_realtime_signal(signal)
+                                socketio.emit('new_signal', payload, to=f'user_{self.user_id}')
+                                send_signal_notification(payload, mode='backtest', user_id=self.user_id)
+                            except Exception:
+                                pass
+
                             symbol_detected.append(signal)
 
         return symbol_detected, strikes_scanned, strikes_total, instruments_missing, candles_missing
@@ -1010,13 +1114,13 @@ class ScannerEngine:
             if not instrument:
                 return None
             interval_minutes = max(1, self._safe_int(timeframe, 5))
-            to_date = datetime.now() - timedelta(minutes=interval_minutes)
-            from_date = to_date - timedelta(minutes=interval_minutes * 40)
+            now = datetime.now()
+            latest_start, previous_start = self.angel_api._live_candle_window(now, interval_minutes)
             candles = self.angel_api.get_historical_data(
                 symbol=instrument['symbol'],
                 timeframe=timeframe,
-                from_date=from_date,
-                to_date=to_date,
+                from_date=previous_start,
+                to_date=latest_start,
                 exchange='NFO',
                 symbol_token=instrument['token']
             ) or []
@@ -1030,7 +1134,6 @@ class ScannerEngine:
             curr_high = float(curr[2]) if len(curr) > 2 else None
             curr_low = float(curr[3]) if len(curr) > 3 else None
             volume = int(float(curr[5])) if len(curr) > 5 else 0
-            rsi = self._calculate_rsi(candles, period=14)
             ts = self._parse_candle_time(curr[0]) if len(curr) > 0 else None
             return {
                 'symbol': instrument['symbol'],
@@ -1043,7 +1146,7 @@ class ScannerEngine:
                 'current_candle_close': curr_close,
                 'volume': volume,
                 'open_interest': 0,
-                'rsi': rsi,
+                'rsi': None,
                 'candle_time': ts
             }
         except Exception:
@@ -1482,6 +1585,7 @@ class ScannerEngine:
                 symbol=signal['symbol'],
                 option_type=signal['option_type'],
                 strike_price=self._normalize_signal_strike(signal.get('strike_price'), signal.get('symbol')),
+                spot_price=signal.get('spot_price'),
                 expiry_date=signal['expiry_date'],
                 entry_price=signal['entry_price'],
                 current_price=signal['current_price'],
@@ -1870,7 +1974,7 @@ class ScannerEngine:
         if now < close_ready_at:
             return False, None
 
-        latest_closed_candle = current_bucket - timedelta(minutes=interval)
+        latest_closed_candle = current_bucket
         if self._last_processed_live_candle and latest_closed_candle <= self._last_processed_live_candle:
             return False, latest_closed_candle
 
@@ -1894,7 +1998,9 @@ class ScannerEngine:
             sorted_strikes,
             key=lambda strike: (abs(strike - float(spot_price)), strike)
         )
-        return ordered[:strike_count]
+        # strike_range means strikes above/below ATM, so total = (2 * strike_count + 1).
+        total = (strike_count * 2) + 1
+        return ordered[:total]
 
     def _split_strikes_for_option_types(self, spot_price, strikes, strike_count):
         normalized = sorted(set(float(s) for s in (strikes or [])))
@@ -1921,6 +2027,40 @@ class ScannerEngine:
         return {
             'PE': pe_ordered[:count],
             'CE': ce_ordered[:count]
+        }
+
+    def _apply_live_strike_exclusions(self, symbol, spot_price, strikes_by_type):
+        """Live-mode strike exclusion: remove ATM and next N strikes on both sides."""
+        try:
+            exclude_count = self._safe_int(getattr(self.config, 'live_exclude_atm_strikes', 0), 0)
+        except Exception:
+            exclude_count = 0
+        if exclude_count <= 0:
+            return strikes_by_type
+
+        ce_strikes = [float(s) for s in (strikes_by_type or {}).get('CE', []) if s is not None]
+        pe_strikes = [float(s) for s in (strikes_by_type or {}).get('PE', []) if s is not None]
+        combined = sorted(set(ce_strikes + pe_strikes))
+        if not combined:
+            return strikes_by_type
+
+        try:
+            spot = float(spot_price or 0)
+        except Exception:
+            spot = 0.0
+        atm_idx = min(range(len(combined)), key=lambda i: abs(combined[i] - spot))
+
+        exclude_indices = {atm_idx}
+        for i in range(1, exclude_count + 1):
+            if atm_idx - i >= 0:
+                exclude_indices.add(atm_idx - i)
+            if atm_idx + i < len(combined):
+                exclude_indices.add(atm_idx + i)
+        exclude_values = {combined[i] for i in exclude_indices}
+
+        return {
+            'CE': [s for s in ce_strikes if s not in exclude_values],
+            'PE': [s for s in pe_strikes if s not in exclude_values]
         }
 
     def _normalize_strike_candidates_for_spot(self, spot_price, strikes, symbol=None):

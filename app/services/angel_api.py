@@ -8,6 +8,7 @@ except Exception:
     pyotp = None
 from datetime import datetime, timedelta, date
 from collections import deque
+from threading import Lock
 import time
 import logging
 import os
@@ -108,8 +109,21 @@ class AngelOneAPI:
         self.refresh_token = None
         self.cache = {}
         self.cache_expiry = {}
+        self._candle_pair_cache = {}
+        self._candle_pair_lock = Lock()
         self.scrip_master = None
         self.scrip_index = {}
+        self._strike_cache = {}
+        self._strike_cache_loaded = False
+        self._strike_cache_lock = Lock()
+        self._strike_cache_enabled = str(os.getenv('STRIKE_CACHE_ENABLED', 'true')).strip().lower() in ('1', 'true', 'yes', 'on')
+        self._strike_cache_ttl_seconds = int(os.getenv('STRIKE_CACHE_TTL_SECONDS', '21600'))  # 6 hours
+        self._strike_cache_path = os.getenv(
+            'STRIKE_CACHE_PATH',
+            os.path.join(os.getcwd(), 'data', 'strike_universe_cache.json')
+        )
+        self._strike_cache_precompute = str(os.getenv('STRIKE_CACHE_PRECOMPUTE', 'false')).strip().lower() in ('1', 'true', 'yes', 'on')
+        self._strike_cache_exchange = str(os.getenv('STRIKE_CACHE_EXCHANGE', 'NFO') or 'NFO').strip().upper()
         self.scrip_master_path = os.getenv(
             'ANGEL_SCRIP_MASTER_PATH',
             os.path.join(os.getcwd(), 'data', 'OpenAPIScripMaster.json')
@@ -560,6 +574,11 @@ class AngelOneAPI:
 
         self.scrip_master = data
         self._build_scrip_index()
+        if self._strike_cache_enabled and self._strike_cache_precompute:
+            try:
+                self._precompute_strike_cache()
+            except Exception as exc:
+                logger.warning('Strike cache precompute failed: %s', str(exc))
         return True
 
     def _build_scrip_index(self):
@@ -707,6 +726,10 @@ class AngelOneAPI:
         underlying = (underlying or '').upper()
         exchange = (exchange or 'NFO').upper()
         expiry_date = expiry if not isinstance(expiry, datetime) else expiry.date()
+        cache_key = self._strike_cache_key(exchange, underlying, expiry_date)
+        cached = self._get_strike_cache(cache_key)
+        if cached is not None:
+            return list(cached)
         strikes = set()
 
         for item in self.scrip_master:
@@ -735,7 +758,45 @@ class AngelOneAPI:
             candidate = strike / 100.0 if strike > 100000 else strike
             strikes.add(round(float(candidate), 2))
 
-        return sorted(strikes)
+        result = sorted(strikes)
+        self._set_strike_cache(cache_key, result)
+        return result
+
+    def get_option_tokens_for_expiry(self, underlying, expiry, exchange='NFO'):
+        """
+        Return option instrument tokens for an underlying/expiry.
+        """
+        if not self.load_scrip_master():
+            return []
+
+        underlying = (underlying or '').upper()
+        exchange = (exchange or 'NFO').upper()
+        expiry_date = expiry if not isinstance(expiry, datetime) else expiry.date()
+        tokens = []
+
+        for item in self.scrip_master:
+            exch = (item.get('exch_seg') or item.get('exchange') or '').upper()
+            if exch != exchange:
+                continue
+
+            name = (item.get('name') or '').upper()
+            symbol = (item.get('symbol') or item.get('tradingsymbol') or '').upper()
+            if name != underlying and not symbol.startswith(underlying):
+                continue
+
+            item_expiry = self._parse_expiry(item.get('expiry'))
+            if not item_expiry or item_expiry != expiry_date:
+                continue
+
+            option_type = item.get('optiontype') or item.get('option_type')
+            if not option_type and not (symbol.endswith('CE') or symbol.endswith('PE')):
+                continue
+
+            token = item.get('token') or item.get('symboltoken')
+            if token:
+                tokens.append(str(token))
+
+        return tokens
 
     def _normalize_strike(self, value):
         if value is None:
@@ -776,6 +837,103 @@ class AngelOneAPI:
                     'exch_seg': exch
                 }
         return None
+
+    def _strike_cache_key(self, exchange, underlying, expiry_date):
+        exp = expiry_date.isoformat() if hasattr(expiry_date, 'isoformat') else str(expiry_date)
+        return f'{exchange}:{underlying}:{exp}'
+
+    def _load_strike_cache(self):
+        if self._strike_cache_loaded or not self._strike_cache_enabled:
+            return
+        self._strike_cache_loaded = True
+        path = self._strike_cache_path
+        if not path or not os.path.exists(path):
+            return
+        try:
+            with open(path, 'r', encoding='utf-8') as handle:
+                data = json.load(handle) or {}
+            entries = data.get('entries') if isinstance(data, dict) else {}
+            if isinstance(entries, dict):
+                self._strike_cache = entries
+        except Exception as exc:
+            logger.warning('Failed to load strike cache: %s', str(exc))
+
+    def _save_strike_cache(self):
+        if not self._strike_cache_enabled:
+            return
+        path = self._strike_cache_path
+        if not path:
+            return
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            payload = {'entries': self._strike_cache}
+            with open(path, 'w', encoding='utf-8') as handle:
+                json.dump(payload, handle, ensure_ascii=True)
+        except Exception as exc:
+            logger.warning('Failed to save strike cache: %s', str(exc))
+
+    def _get_strike_cache(self, key):
+        if not self._strike_cache_enabled:
+            return None
+        self._load_strike_cache()
+        with self._strike_cache_lock:
+            entry = self._strike_cache.get(key)
+        if not entry or not isinstance(entry, dict):
+            return None
+        ts = entry.get('ts')
+        try:
+            if ts is None:
+                return None
+            if (time.time() - float(ts)) > float(self._strike_cache_ttl_seconds):
+                return None
+        except Exception:
+            return None
+        strikes = entry.get('strikes')
+        return strikes if isinstance(strikes, list) else None
+
+    def _set_strike_cache(self, key, strikes):
+        if not self._strike_cache_enabled:
+            return
+        now = time.time()
+        with self._strike_cache_lock:
+            self._strike_cache[key] = {'ts': now, 'strikes': list(strikes or [])}
+            if len(self._strike_cache) > 50000:
+                self._strike_cache.clear()
+        self._save_strike_cache()
+
+    def _precompute_strike_cache(self):
+        if not self.scrip_master or not self._strike_cache_enabled:
+            return
+        exchange = self._strike_cache_exchange or 'NFO'
+        cache = {}
+        for item in self.scrip_master:
+            exch = (item.get('exch_seg') or item.get('exchange') or '').upper()
+            if exch != exchange:
+                continue
+            option_type = item.get('optiontype') or item.get('option_type')
+            symbol = (item.get('symbol') or item.get('tradingsymbol') or '').upper()
+            if not option_type and not (symbol.endswith('CE') or symbol.endswith('PE')):
+                continue
+            underlying = (item.get('name') or '').upper()
+            if not underlying:
+                continue
+            expiry = self._parse_expiry(item.get('expiry'))
+            if not expiry:
+                continue
+            strike = self._normalize_strike(item.get('strike'))
+            if strike is None:
+                continue
+            candidate = strike / 100.0 if strike > 100000 else strike
+            key = self._strike_cache_key(exchange, underlying, expiry)
+            cache.setdefault(key, set()).add(round(float(candidate), 2))
+
+        now = time.time()
+        with self._strike_cache_lock:
+            self._strike_cache = {
+                key: {'ts': now, 'strikes': sorted(list(values))}
+                for key, values in cache.items()
+            }
+        self._save_strike_cache()
 
     def lookup_option_instrument(self, underlying, expiry, strike, option_type, exchange='NFO'):
         """Lookup option instrument token using scrip master."""
@@ -991,16 +1149,42 @@ class AngelOneAPI:
         if not instrument:
             return None
 
+        # Prefer streaming candle cache when enabled.
+        try:
+            from app.services.streaming_manager import get_streaming_candle_pair
+            streaming = get_streaming_candle_pair(instrument.get('token'), self._interval_minutes(timeframe))
+            if streaming:
+                return {
+                    'symbol': instrument['symbol'],
+                    'option_type': option_type,
+                    'strike_price': strike,
+                    'previous_candle_close': streaming.get('previous_candle_close'),
+                    'current_candle_open': None,
+                    'current_candle_high': None,
+                    'current_candle_low': None,
+                    'current_candle_close': streaming.get('current_candle_close'),
+                    'volume': 0,
+                    'open_interest': 0,
+                    'rsi': None,
+                    'candle_time': streaming.get('candle_time')
+                }
+        except Exception:
+            pass
+
         interval_minutes = self._interval_minutes(timeframe)
-        # Pull a recent window and exclude the potentially in-progress candle.
-        # Keep enough closed candles to compute RSI(14).
-        to_date = datetime.now() - timedelta(minutes=interval_minutes)
-        from_date = to_date - timedelta(minutes=interval_minutes * 30)
+        now = datetime.now()
+        latest_start, previous_start = self._live_candle_window(now, interval_minutes)
+        cache_key = (str(instrument.get('token')), str(exchange or ''), int(interval_minutes), latest_start.isoformat())
+        with self._candle_pair_lock:
+            cached = self._candle_pair_cache.get(cache_key)
+        if cached:
+            return dict(cached)
+
         candles = self.get_historical_data(
             symbol=instrument['symbol'],
             timeframe=timeframe,
-            from_date=from_date,
-            to_date=to_date,
+            from_date=previous_start,
+            to_date=latest_start,
             exchange=exchange,
             symbol_token=instrument['token']
         )
@@ -1020,11 +1204,9 @@ class AngelOneAPI:
         except Exception:
             return None
 
-        rsi = self._calculate_rsi(candles, period=14)
-
         prev_ts = self._parse_candle_time(prev[0]) if len(prev) > 0 else None
         ts = self._parse_candle_time(curr[0]) if len(curr) > 0 else None
-        return {
+        payload = {
             'symbol': instrument['symbol'],
             'option_type': option_type,
             'strike_price': strike,
@@ -1035,9 +1217,14 @@ class AngelOneAPI:
             'current_candle_close': curr_close,
             'volume': volume,
             'open_interest': 0,
-            'rsi': rsi,
+            'rsi': None,
             'candle_time': ts
         }
+        with self._candle_pair_lock:
+            self._candle_pair_cache[cache_key] = dict(payload)
+            if len(self._candle_pair_cache) > 5000:
+                self._candle_pair_cache.clear()
+        return payload
 
     def get_previous_close(self, symbol, exchange, symbol_token, timeframe):
         """Fetch previous candle close for the given symbol."""
@@ -1086,6 +1273,13 @@ class AngelOneAPI:
             except Exception:
                 return 5
         return 5
+
+    def _live_candle_window(self, now, interval_minutes):
+        interval = max(1, int(interval_minutes))
+        bucket_minute = (now.minute // interval) * interval
+        latest_start = now.replace(minute=bucket_minute, second=0, microsecond=0)
+        previous_start = latest_start - timedelta(minutes=interval)
+        return latest_start, previous_start
 
     def _parse_candle_time(self, value):
         """Parse SmartAPI candle timestamp text into a datetime."""

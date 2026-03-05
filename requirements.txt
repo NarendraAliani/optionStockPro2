@@ -12,6 +12,8 @@ cryptography==41.0.7
 
 # Angel One API
 smartapi-python==1.3.0
+rq==1.15.1
+redis==5.0.1
 
 # Data Processing
 pandas==2.1.4

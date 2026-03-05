@@ -127,6 +127,45 @@ A Python-based web application for scanning NIFTY stock options in real-time and
 4. View historical signals with timestamps
 5. Analyze performance metrics
 
+## Live Queue + Redis
+
+For heavy live scans, the queue mode is recommended.
+
+### Enable queue mode
+
+1. Set in `.env`:
+   ```
+   REDIS_URL=redis://localhost:6379/0
+   LIVE_SCAN_USE_QUEUE=true
+   ```
+2. Verify Redis:
+   ```
+   scripts\\check_redis.ps1
+   ```
+3. Start worker:
+   ```
+   scripts\\start_rq_worker.ps1
+   ```
+4. Start the app:
+   ```
+   python run.py
+   ```
+
+### Health check
+
+`GET /api/health` now reports `redis: ok|error|disabled`.
+
+### Auto-start Redis + Worker (Windows)
+
+1. Ensure Redis service is automatic:
+   ```
+   scripts\\enable_redis_service.ps1
+   ```
+2. Register RQ worker task:
+   ```
+   scripts\\register_worker_task.ps1
+   ```
+
 ## Project Structure
 
 ```

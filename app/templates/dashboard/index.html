@@ -67,6 +67,7 @@
         </div>
         <div class="mini-card-body">
             <div class="mini-stat"><span>Summary:</span> <span class="config-text-compact" id="configSummaryText">Loading configuration...</span></div>
+            <div class="mini-stat"><span>Health:</span> <span class="status-badge-gray" id="healthBadge">Checking...</span></div>
         </div>
     </div>
 
@@ -200,6 +201,7 @@
                     <tr>
                         <th><i class="fas fa-calendar"></i> Time</th>
                         <th><i class="fas fa-chart-line"></i> Stock</th>
+                        <th><i class="fas fa-bullseye"></i> CMP</th>
                         <th><i class="fas fa-arrow-up-down"></i> Strike</th>
                         <th><i class="fas fa-flag"></i> Type</th>
                         <th><i class="fas fa-dollar-sign"></i> Prev Close (Entry Basis)</th>
@@ -224,6 +226,7 @@
                     <tr>
                         <th><i class="fas fa-calendar"></i> Time</th>
                         <th><i class="fas fa-chart-line"></i> Stock</th>
+                        <th><i class="fas fa-bullseye"></i> CMP</th>
                         <th><i class="fas fa-arrow-up-down"></i> Strike</th>
                         <th><i class="fas fa-flag"></i> Type</th>
                         <th><i class="fas fa-dollar-sign"></i> Prev Close (Entry Basis)</th>
@@ -411,6 +414,8 @@
         loadSoundPreferences();
         updateSignalSoundButton();
         loadScannerConfig();
+        refreshHealthBadge();
+        setInterval(refreshHealthBadge, 15000);
 
         // Start Live Scanner
         $('#btnStartLive').on('click', function(e) {
@@ -1263,6 +1268,7 @@
                     }
                 },
                 { data: 'stock' },
+                { data: 'cmp' },
                 { data: 'strike' },
                 { data: 'type' },
                 { data: 'entry_price' },
@@ -1317,6 +1323,38 @@
         $('#configSummaryText').text(text);
         $('#liveConfigSummary').text(text);
         $('#backtestConfigSummary').text(text);
+    }
+
+    function refreshHealthBadge() {
+        $.ajax({
+            url: '/api/health',
+            method: 'GET',
+            cache: false,
+            success: function(response) {
+                const badge = $('#healthBadge');
+                const redisStatus = String((response || {}).redis || 'unknown');
+                const workerStatus = String((response || {}).worker_status || 'unknown');
+                const workerCount = Number((response || {}).worker_count || 0);
+                let label = 'Redis: ' + redisStatus + ', Worker: ' + workerStatus;
+                if (workerStatus === 'ok') {
+                    label += ' (' + workerCount + ')';
+                }
+                badge.text(label);
+                badge.removeClass('status-badge-gray status-badge-green status-badge-red');
+                if (redisStatus === 'ok' && workerStatus === 'ok') {
+                    badge.addClass('status-badge-green');
+                } else if (redisStatus === 'error' || workerStatus.indexOf('error') === 0) {
+                    badge.addClass('status-badge-red');
+                } else {
+                    badge.addClass('status-badge-gray');
+                }
+            },
+            error: function() {
+                const badge = $('#healthBadge');
+                badge.text('Redis: error, Worker: error');
+                badge.removeClass('status-badge-gray status-badge-green').addClass('status-badge-red');
+            }
+        });
     }
 
     function estimateStockUniverse(config) {
@@ -1518,6 +1556,7 @@
             time_display: formatTime(signal.detected_at),
             time_sort: parsed ? parsed.getTime() : 0,
             stock: formatContractSymbol(signal.symbol),
+            cmp: formatPrice(signal.spot_price),
             strike: formatStrike(signal.strike_price, signal.symbol),
             type: formatOptionTypeBadge(signal.option_type),
             entry_price: formatPrice(signal.entry_price),
