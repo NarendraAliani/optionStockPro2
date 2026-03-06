@@ -300,8 +300,8 @@ def get_scanner_config():
         user_token = str(getattr(current_user, 'telegram_bot_token', '') or '')
         user_channel = str(getattr(current_user, 'telegram_channel_id', '') or '')
         config.update({
-            'telegramBotToken': user_token,
-            'telegramChannelId': user_channel,
+            'telegramBotToken': '',
+            'telegramChannelId': '',
             'telegramBotTokenPlaceholder': user_token or token_effective or '',
             'telegramChannelIdPlaceholder': user_channel or channel_effective or ''
         })
