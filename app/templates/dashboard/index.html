@@ -134,6 +134,7 @@
             <div class="mini-stat"><span>Strikes scanned:</span> <span id="liveStrikesScanned">0</span></div>
             <div class="mini-stat"><span>Skip Candles:</span> <span id="liveSkippedCandles">0</span></div>
             <div class="mini-stat"><span>Workers:</span> <span id="liveWorkers">--</span></div>
+            <div class="mini-stat"><span>Worker Status:</span> <span class="status-badge-gray" id="liveWorkerBadge">Unknown</span></div>
             <div class="mini-stat"><span>Generated:</span> <span id="liveSignalsGenerated">0</span></div>
             <div class="mini-stat"><span>Note:</span> <span class="text-small" id="liveProcessNote">Scanner is idle.</span></div>
             <div class="mini-stat"><span>Error:</span> <span class="text-small text-danger" id="liveLastError" style="display:none;"></span></div>
@@ -1332,6 +1333,7 @@
             cache: false,
             success: function(response) {
                 const badge = $('#healthBadge');
+                const liveWorkerBadge = $('#liveWorkerBadge');
                 const redisStatus = String((response || {}).redis || 'unknown');
                 const workerStatus = String((response || {}).worker_status || 'unknown');
                 const workerCount = Number((response || {}).worker_count || 0);
@@ -1348,11 +1350,29 @@
                 } else {
                     badge.addClass('status-badge-gray');
                 }
+                if (liveWorkerBadge.length) {
+                    let workerLabel = 'Unknown';
+                    if (workerStatus === 'ok') {
+                        workerLabel = 'Running';
+                    } else if (workerStatus.indexOf('error') === 0) {
+                        workerLabel = 'Down';
+                    } else if (workerStatus === 'disabled') {
+                        workerLabel = 'Disabled';
+                    }
+                    liveWorkerBadge
+                        .text(workerLabel)
+                        .removeClass('status-badge-gray status-badge-green status-badge-red')
+                        .addClass(workerStatus === 'ok' ? 'status-badge-green' : (workerStatus.indexOf('error') === 0 ? 'status-badge-red' : 'status-badge-gray'));
+                }
             },
             error: function() {
                 const badge = $('#healthBadge');
                 badge.text('Redis: error, Worker: error');
                 badge.removeClass('status-badge-gray status-badge-green').addClass('status-badge-red');
+                const liveWorkerBadge = $('#liveWorkerBadge');
+                if (liveWorkerBadge.length) {
+                    liveWorkerBadge.text('Down').removeClass('status-badge-gray status-badge-green').addClass('status-badge-red');
+                }
             }
         });
     }
