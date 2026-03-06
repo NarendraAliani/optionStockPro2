@@ -273,6 +273,19 @@ class ScannerEngine:
                 queue = get_queue()
             except Exception:
                 queue = None
+        if queue:
+            try:
+                from rq import Worker
+                active_workers = Worker.all(queue=queue) or []
+                if not active_workers:
+                    queue = None
+                    if progress_callback:
+                        progress_callback(
+                            self.user_id,
+                            error='RQ worker not running. Falling back to local scan.'
+                        )
+            except Exception:
+                queue = None
 
         if queue:
             jobs = []
