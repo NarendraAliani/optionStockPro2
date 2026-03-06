@@ -19,6 +19,7 @@ import logging
 import os
 from datetime import datetime
 from pathlib import Path
+from sqlalchemy.exc import SQLAlchemyError
 
 scanner_bp = Blueprint('scanner', __name__)
 logger = logging.getLogger(__name__)
@@ -401,7 +402,20 @@ def save_scanner_config():
         if channel_id:
             current_user.telegram_channel_id = channel_id
 
-    db.session.commit()
+    try:
+        db.session.commit()
+    except SQLAlchemyError as exc:
+        db.session.rollback()
+        detail = str(exc)
+        if 'min_signal_volume' in detail or 'scanner_configs' in detail:
+            return jsonify({
+                'success': False,
+                'error': 'Database upgrade required. Run: flask db upgrade'
+            }), 500
+        return jsonify({
+            'success': False,
+            'error': 'Failed to save configuration.'
+        }), 500
     try:
         from app.services.telegram_notifier import invalidate_notification_pref_cache
         invalidate_notification_pref_cache(current_user.id)
@@ -478,7 +492,11 @@ def import_scanner_config():
         if channel_id:
             current_user.telegram_channel_id = channel_id
 
-    db.session.commit()
+    try:
+        db.session.commit()
+    except SQLAlchemyError:
+        db.session.rollback()
+        return jsonify({'success': False, 'error': 'Failed to import configuration.'}), 500
     try:
         from app.services.telegram_notifier import invalidate_notification_pref_cache
         invalidate_notification_pref_cache(current_user.id)
