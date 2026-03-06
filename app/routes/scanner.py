@@ -392,10 +392,14 @@ def save_scanner_config():
     current_user.guardrail_enabled = _coerce_bool(payload.get('guardrailEnabled'), default=True)
     current_user.guardrail_load_threshold = _clamp_int(payload.get('guardrailLoadThreshold', 1200), 100, 25000, 1200)
     current_user.notification_services_enabled = _coerce_bool(payload.get('notificationServicesEnabled'), default=True)
-    token = str(raw_payload.get('telegramBotToken') or '').strip()
-    channel_id = str(raw_payload.get('telegramChannelId') or '').strip()
-    current_user.telegram_bot_token = token or None
-    current_user.telegram_channel_id = channel_id or None
+    if 'telegramBotToken' in raw_payload:
+        token = str(raw_payload.get('telegramBotToken') or '').strip()
+        if token:
+            current_user.telegram_bot_token = token
+    if 'telegramChannelId' in raw_payload:
+        channel_id = str(raw_payload.get('telegramChannelId') or '').strip()
+        if channel_id:
+            current_user.telegram_channel_id = channel_id
 
     db.session.commit()
     try:
@@ -469,9 +473,10 @@ def import_scanner_config():
     if isinstance(cfg_payload, dict):
         token = str(cfg_payload.get('telegramBotToken') or '').strip()
         channel_id = str(cfg_payload.get('telegramChannelId') or '').strip()
-        if token or channel_id:
-            current_user.telegram_bot_token = token or None
-            current_user.telegram_channel_id = channel_id or None
+        if token:
+            current_user.telegram_bot_token = token
+        if channel_id:
+            current_user.telegram_channel_id = channel_id
 
     db.session.commit()
     try:

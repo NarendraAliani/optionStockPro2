@@ -220,12 +220,12 @@
                 <div class="config-card-body">
                     <div class="form-group">
                         <label class="form-label" for="telegramChannelId">Telegram Channel ID</label>
-                        <input type="text" class="form-control" id="telegramChannelId" placeholder="">
+                        <input type="text" class="form-control placeholder-red" id="telegramChannelId" placeholder="">
                         <small class="form-help">Leave blank to use the server default channel ID.</small>
                     </div>
                     <div class="form-group">
                         <label class="form-label" for="telegramBotToken">Telegram Bot Token</label>
-                        <input type="text" class="form-control" id="telegramBotToken" placeholder="">
+                        <input type="text" class="form-control placeholder-red" id="telegramBotToken" placeholder="">
                         <small class="form-help">Leave blank to use the server default bot token.</small>
                     </div>
                     <div class="form-group">
@@ -256,6 +256,21 @@
         </div>
     </div>
 </div>
+{% endblock %}
+
+{% block extra_css %}
+<style>
+    .placeholder-red::placeholder {
+        color: #d0342c;
+        opacity: 1;
+    }
+    .placeholder-red::-ms-input-placeholder {
+        color: #d0342c;
+    }
+    .placeholder-red::-webkit-input-placeholder {
+        color: #d0342c;
+    }
+</style>
 {% endblock %}
 
 
