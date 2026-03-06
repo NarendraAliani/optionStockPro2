@@ -119,6 +119,10 @@
                             <input class="form-check-input" type="checkbox" id="autoTune">
                             <label class="form-check-label" for="autoTune">Auto Tune Workers</label>
                         </div>
+                        <div class="form-check mb-2">
+                            <input class="form-check-input" type="checkbox" id="liveUseQueue">
+                            <label class="form-check-label" for="liveUseQueue">Live Mode Queue (RQ)</label>
+                        </div>
                         <div class="form-check">
                             <input class="form-check-input" type="checkbox" id="livePrefilterEnabled">
                             <label class="form-check-label" for="livePrefilterEnabled">Live Pre-filter Enabled</label>
@@ -360,6 +364,7 @@
                 $('#scanProfile').val(cfg.scanProfile || 'balanced');
                 $('#workersCap').val(cfg.workers || 8);
                 $('#autoTune').prop('checked', cfg.autoTune !== false);
+                $('#liveUseQueue').prop('checked', cfg.liveUseQueue === true);
                 $('#livePrefilterEnabled').prop('checked', cfg.livePrefilterEnabled !== false);
                 $('#livePrefilterTopMovers').val(cfg.livePrefilterTopMovers || 30);
                 $('#livePrefilterTopVolume').val(cfg.livePrefilterTopVolume || 30);
@@ -412,6 +417,7 @@
             liveWorkersCap: $('#workersCap').val(),
             backtestWorkersCap: $('#workersCap').val(),
             autoTune: $('#autoTune').is(':checked'),
+            liveUseQueue: $('#liveUseQueue').is(':checked'),
             livePrefilterEnabled: $('#livePrefilterEnabled').is(':checked'),
             livePrefilterTopMovers: $('#livePrefilterTopMovers').val(),
             livePrefilterTopVolume: $('#livePrefilterTopVolume').val(),

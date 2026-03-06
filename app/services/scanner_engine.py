@@ -48,6 +48,7 @@ class ScannerEngine:
         live_prefilter_top_movers=None,
         live_prefilter_top_volume=None,
         live_prefilter_max_stocks=None,
+        live_use_queue=None,
         backtest_rebalance_frequency='weekly',
         backtest_strict_first_candle=True,
         backtest_liquidity_filter_enabled=True,
@@ -102,6 +103,7 @@ class ScannerEngine:
             live_prefilter_max_stocks if live_prefilter_max_stocks is not None else os.getenv('LIVE_PREFILTER_MAX_STOCKS', '50'),
             50
         )
+        self._live_use_queue = live_use_queue
         self._candle_close_delay_seconds = self._safe_int(os.getenv('LIVE_CANDLE_CLOSE_DELAY_SECONDS', '8'), 8)
         self.max_workers = max(1, min(16, self._safe_int(workers, 8)))
         self._stop_event = Event()
@@ -128,6 +130,8 @@ class ScannerEngine:
         self._historical_cache = OrderedDict()
         self._historical_cache_max = self._safe_int(os.getenv('HISTORICAL_CACHE_MAX', '2000'), 2000)
         self._last_api_stats_log_at = 0.0
+        self._queue_missing_since = None
+        self._queue_force_disabled = False
     
     def start_live_scan(self):
         """Start live scanning"""
@@ -265,7 +269,12 @@ class ScannerEngine:
         if not symbol_jobs:
             return detected
 
-        use_queue = str(os.getenv('LIVE_SCAN_USE_QUEUE', 'false')).strip().lower() in ('1', 'true', 'yes', 'on')
+        if self._live_use_queue is None:
+            use_queue = str(os.getenv('LIVE_SCAN_USE_QUEUE', 'false')).strip().lower() in ('1', 'true', 'yes', 'on')
+        else:
+            use_queue = bool(self._live_use_queue)
+        if self._queue_force_disabled:
+            use_queue = False
         queue = None
         if use_queue:
             try:
@@ -277,13 +286,22 @@ class ScannerEngine:
             try:
                 from rq import Worker
                 active_workers = Worker.all(queue=queue) or []
-                if not active_workers:
+                if active_workers:
+                    self._queue_missing_since = None
+                    self._queue_force_disabled = False
+                else:
+                    now = time.time()
+                    if self._queue_missing_since is None:
+                        self._queue_missing_since = now
+                    elif now - self._queue_missing_since >= 30:
+                        self._queue_force_disabled = True
                     queue = None
                     if progress_callback:
-                        progress_callback(
-                            self.user_id,
-                            error='RQ worker not running. Falling back to local scan.'
-                        )
+                        if self._queue_force_disabled:
+                            msg = 'RQ worker missing >30s. Queue disabled; using local scan.'
+                        else:
+                            msg = 'RQ worker not running. Falling back to local scan.'
+                        progress_callback(self.user_id, error=msg)
             except Exception:
                 queue = None
 

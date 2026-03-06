@@ -26,6 +26,7 @@ class User(UserMixin, db.Model):
     live_prefilter_top_movers = db.Column(db.Integer, nullable=False, default=30)
     live_prefilter_top_volume = db.Column(db.Integer, nullable=False, default=30)
     live_prefilter_max_stocks = db.Column(db.Integer, nullable=False, default=50)
+    live_use_queue = db.Column(db.Boolean, nullable=False, default=False)
     backtest_rebalance_frequency = db.Column(db.String(20), nullable=False, default='weekly')
     backtest_strict_first_candle = db.Column(db.Boolean, nullable=False, default=True)
     backtest_liquidity_filter_enabled = db.Column(db.Boolean, nullable=False, default=True)

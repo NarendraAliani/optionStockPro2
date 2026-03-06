@@ -496,11 +496,16 @@ def start_live_scan(app, user_id, config_data):
         config = _build_scanner_config(user_id, config_data, mode='live')
         worker_count, tune_detail = _effective_worker_count(user_id, config_data, mode='live')
         prefilter = _resolve_live_prefilter_settings(user_id, config_data)
+        live_use_queue = _safe_bool(
+            (config_data or {}).get('liveUseQueue'),
+            default=bool(getattr(user, 'live_use_queue', False))
+        )
         engine = ScannerEngine(
             user_id=user_id,
             config=config,
             angel_api=angel_api,
             workers=worker_count,
+            live_use_queue=live_use_queue,
             live_prefilter_enabled=prefilter['enabled'],
             live_prefilter_top_movers=prefilter['top_movers'],
             live_prefilter_top_volume=prefilter['top_volume'],
@@ -1082,6 +1087,7 @@ def trigger_webhook_scan(app, user_id, symbol, timeframe=None, candle_time=None,
                 config=config,
                 angel_api=angel_api,
                 workers=1,
+                live_use_queue=bool(getattr(user, 'live_use_queue', False)),
                 live_prefilter_enabled=False,
                 live_prefilter_top_movers=0,
                 live_prefilter_top_volume=0,

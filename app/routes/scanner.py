@@ -107,6 +107,7 @@ def _user_runtime_defaults():
     scan_workers = max(1, min(16, int(getattr(current_user, 'scan_workers', DEFAULT_SCAN_WORKERS) or DEFAULT_SCAN_WORKERS)))
     live_cap = max(1, min(16, int(getattr(current_user, 'live_workers_cap', scan_workers) or scan_workers)))
     backtest_cap = max(1, min(16, int(getattr(current_user, 'backtest_workers_cap', scan_workers) or scan_workers)))
+    env_live_queue = str(os.getenv('LIVE_SCAN_USE_QUEUE', 'false')).strip().lower() in ('1', 'true', 'yes', 'on')
     return {
         'workers': scan_workers,
         'autoTune': bool(getattr(current_user, 'auto_tune_default', True)),
@@ -115,6 +116,7 @@ def _user_runtime_defaults():
         'livePrefilterTopMovers': _clamp_int(getattr(current_user, 'live_prefilter_top_movers', 30), 0, 500, 30),
         'livePrefilterTopVolume': _clamp_int(getattr(current_user, 'live_prefilter_top_volume', 30), 0, 500, 30),
         'livePrefilterMaxStocks': _clamp_int(getattr(current_user, 'live_prefilter_max_stocks', 50), 1, 500, 50),
+        'liveUseQueue': bool(getattr(current_user, 'live_use_queue', env_live_queue)),
         'liveWorkersCap': live_cap,
         'backtestWorkersCap': backtest_cap,
         'backtestRebalanceFrequency': _normalize_rebalance_frequency(
@@ -209,6 +211,10 @@ def _normalize_config_payload(data):
         1,
         500,
         50
+    )
+    payload['liveUseQueue'] = _coerce_bool(
+        data.get('liveUseQueue', payload.get('liveUseQueue', False)),
+        default=False
     )
     payload['liveWorkersCap'] = _clamp_int(
         data.get('liveWorkersCap', payload.get('liveWorkersCap', DEFAULT_SCAN_WORKERS)),
@@ -385,6 +391,7 @@ def save_scanner_config():
     current_user.live_prefilter_top_movers = _clamp_int(payload.get('livePrefilterTopMovers', 30), 0, 500, 30)
     current_user.live_prefilter_top_volume = _clamp_int(payload.get('livePrefilterTopVolume', 30), 0, 500, 30)
     current_user.live_prefilter_max_stocks = _clamp_int(payload.get('livePrefilterMaxStocks', 50), 1, 500, 50)
+    current_user.live_use_queue = _coerce_bool(payload.get('liveUseQueue'), default=False)
     current_user.backtest_rebalance_frequency = _normalize_rebalance_frequency(payload.get('backtestRebalanceFrequency', 'weekly'))
     current_user.backtest_strict_first_candle = _coerce_bool(payload.get('backtestStrictFirstCandle'), default=True)
     current_user.backtest_liquidity_filter_enabled = _coerce_bool(payload.get('backtestLiquidityFilterEnabled'), default=True)
@@ -476,6 +483,7 @@ def import_scanner_config():
     current_user.live_prefilter_top_movers = _clamp_int(payload.get('livePrefilterTopMovers', 30), 0, 500, 30)
     current_user.live_prefilter_top_volume = _clamp_int(payload.get('livePrefilterTopVolume', 30), 0, 500, 30)
     current_user.live_prefilter_max_stocks = _clamp_int(payload.get('livePrefilterMaxStocks', 50), 1, 500, 50)
+    current_user.live_use_queue = _coerce_bool(payload.get('liveUseQueue'), default=False)
     current_user.backtest_rebalance_frequency = _normalize_rebalance_frequency(payload.get('backtestRebalanceFrequency', 'weekly'))
     current_user.backtest_strict_first_candle = _coerce_bool(payload.get('backtestStrictFirstCandle'), default=True)
     current_user.backtest_liquidity_filter_enabled = _coerce_bool(payload.get('backtestLiquidityFilterEnabled'), default=True)
