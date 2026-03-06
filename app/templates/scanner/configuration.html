@@ -55,6 +55,11 @@
                         <small class="form-help">Signal threshold multiplier</small>
                     </div>
                     <div class="form-group">
+                        <label class="form-label" for="minSignalVolume">Min Signal Volume</label>
+                        <input type="number" class="form-control" id="minSignalVolume" value="10" min="0" max="1000000">
+                        <small class="form-help">Signals require volume greater than or equal to this value.</small>
+                    </div>
+                    <div class="form-group">
                         <label class="form-label" for="timeframe">Timeframe</label>
                         <select class="form-control" id="timeframe">
                             <option value="1">1 Minute</option>
@@ -334,6 +339,7 @@
                 $('#strikeRange').val((cfg.strikeRange ?? 0));
                 $('#liveExcludeAtmStrikes').val((cfg.liveExcludeAtmStrikes ?? 0));
                 $('#priceMultiplier').val(cfg.priceMultiplier || 2);
+                $('#minSignalVolume').val(cfg.minSignalVolume ?? 10);
                 $('#timeframe').val(cfg.timeframe || 15);
                 $('#refreshInterval').val(cfg.refreshInterval || 15);
                 $('#scanProfile').val(cfg.scanProfile || 'balanced');
@@ -383,6 +389,7 @@
             strikeRange: $('#strikeRange').val(),
             liveExcludeAtmStrikes: $('#liveExcludeAtmStrikes').val(),
             priceMultiplier: $('#priceMultiplier').val(),
+            minSignalVolume: $('#minSignalVolume').val(),
             timeframe: $('#timeframe').val(),
             refreshInterval: $('#refreshInterval').val(),
             scanProfile: $('#scanProfile').val(),

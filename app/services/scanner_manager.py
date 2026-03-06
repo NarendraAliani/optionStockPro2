@@ -207,6 +207,7 @@ def _get_user_default_config_payload(user_id):
         'stockSelection': cfg.get_stock_selection() or 'all',
         'strikeRange': int(cfg.strike_range) if cfg.strike_range is not None else 0,
         'liveExcludeAtmStrikes': int(cfg.live_exclude_atm_strikes or 0),
+        'minSignalVolume': int(cfg.min_signal_volume or 10),
         'priceMultiplier': float(cfg.price_multiplier or 2.0),
         'timeframe': int(timeframe_text.replace('min', '') or 5),
         'refreshInterval': max(1, int((cfg.refresh_interval or 300) / 60))
@@ -227,6 +228,12 @@ def _build_scanner_config(user_id, config_data, mode):
     default_strike_range = 0
     strike_range = int(_pick_config_value(config_data, user_defaults, 'strikeRange', default_strike_range))
     exclude_atm = _safe_int(_pick_config_value(config_data, user_defaults, 'liveExcludeAtmStrikes', 0), 0)
+    min_signal_volume = _clamp_int(
+        _pick_config_value(config_data, user_defaults, 'minSignalVolume', 10),
+        0,
+        1_000_000,
+        10
+    )
     price_multiplier = float(_pick_config_value(config_data, user_defaults, 'priceMultiplier', 2.0))
     timeframe = int(_pick_config_value(config_data, user_defaults, 'timeframe', 15))
     allowed_timeframes = {1, 3, 5, 15, 30, 60}
@@ -242,6 +249,7 @@ def _build_scanner_config(user_id, config_data, mode):
         stock_selection=stock_selection,
         strike_range=strike_range,
         live_exclude_atm_strikes=max(0, min(10, exclude_atm)),
+        min_signal_volume=min_signal_volume,
         price_multiplier=price_multiplier,
         timeframe=f'{timeframe}min',
         refresh_interval=refresh_interval,

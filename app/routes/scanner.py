@@ -47,6 +47,7 @@ def _default_config_payload():
         'stockSelection': 'all',
         'strikeRange': 0,
         'liveExcludeAtmStrikes': 0,
+        'minSignalVolume': 10,
         'priceMultiplier': 2.0,
         'timeframe': 15,
         'refreshInterval': 15,
@@ -162,6 +163,15 @@ def _normalize_config_payload(data):
     except Exception:
         pass
     try:
+        payload['minSignalVolume'] = _clamp_int(
+            data.get('minSignalVolume', payload.get('minSignalVolume', 10)),
+            0,
+            1_000_000,
+            10
+        )
+    except Exception:
+        pass
+    try:
         payload['priceMultiplier'] = max(1.0, float(data.get('priceMultiplier', payload['priceMultiplier'])))
     except Exception:
         pass
@@ -260,6 +270,7 @@ def _get_user_default_config(user_id):
         'stockSelection': stock_selection if stock_selection else 'all',
         'strikeRange': int(cfg.strike_range) if cfg.strike_range is not None else 0,
         'liveExcludeAtmStrikes': int(cfg.live_exclude_atm_strikes or 0),
+        'minSignalVolume': int(cfg.min_signal_volume or 10),
         'priceMultiplier': float(cfg.price_multiplier or 2.0),
         'timeframe': int(str(cfg.timeframe or '5').replace('min', '')),
         'refreshInterval': max(1, int((cfg.refresh_interval or 300) / 60)),
@@ -356,6 +367,7 @@ def save_scanner_config():
     cfg.stock_selection = payload['stockSelection']
     cfg.strike_range = payload['strikeRange']
     cfg.live_exclude_atm_strikes = _clamp_int(payload.get('liveExcludeAtmStrikes', 0), 0, 10, 0)
+    cfg.min_signal_volume = _clamp_int(payload.get('minSignalVolume', 10), 0, 1_000_000, 10)
     cfg.price_multiplier = payload['priceMultiplier']
     cfg.timeframe = f"{payload['timeframe']}min"
     cfg.refresh_interval = payload['refreshInterval'] * 60
@@ -430,6 +442,7 @@ def import_scanner_config():
     cfg.stock_selection = payload['stockSelection']
     cfg.strike_range = payload['strikeRange']
     cfg.live_exclude_atm_strikes = _clamp_int(payload.get('liveExcludeAtmStrikes', 0), 0, 10, 0)
+    cfg.min_signal_volume = _clamp_int(payload.get('minSignalVolume', 10), 0, 1_000_000, 10)
     cfg.price_multiplier = payload['priceMultiplier']
     cfg.timeframe = f"{payload['timeframe']}min"
     cfg.refresh_interval = payload['refreshInterval'] * 60
