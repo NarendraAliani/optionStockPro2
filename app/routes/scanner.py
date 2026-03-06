@@ -297,11 +297,13 @@ def get_scanner_config():
         from app.services.telegram_notifier import get_telegram_notifier
         notifier = get_telegram_notifier()
         token_effective, channel_effective = notifier.resolve_credentials(current_user.id)
+        user_token = str(getattr(current_user, 'telegram_bot_token', '') or '')
+        user_channel = str(getattr(current_user, 'telegram_channel_id', '') or '')
         config.update({
-            'telegramBotToken': str(getattr(current_user, 'telegram_bot_token', '') or ''),
-            'telegramChannelId': str(getattr(current_user, 'telegram_channel_id', '') or ''),
-            'telegramBotTokenPlaceholder': token_effective or '',
-            'telegramChannelIdPlaceholder': channel_effective or ''
+            'telegramBotToken': user_token,
+            'telegramChannelId': user_channel,
+            'telegramBotTokenPlaceholder': user_token or token_effective or '',
+            'telegramChannelIdPlaceholder': user_channel or channel_effective or ''
         })
     except Exception:
         config.update({
