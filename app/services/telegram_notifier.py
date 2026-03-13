@@ -79,6 +79,9 @@ class TelegramNotifier:
         self.enabled = _as_bool(_cfg('TELEGRAM_ENABLED', False), default=False)
         self.bot_token = str(_cfg('TELEGRAM_BOT_TOKEN', '') or '').strip()
         self.channel_id = str(_cfg('TELEGRAM_CHANNEL_ID', '') or '').strip()
+        self.cycle_summary_enabled_default = _as_bool(_cfg('TELEGRAM_CYCLE_SUMMARY_ENABLED', True), default=True)
+        self.cycle_summary_mode_default = str(_cfg('TELEGRAM_CYCLE_SUMMARY_MODE', 'SHORT') or 'SHORT').strip().upper()
+        self.cycle_summary_channel_default = str(_cfg('TELEGRAM_CYCLE_SUMMARY_CHANNEL_ID', '') or '').strip()
         self.live_only = _as_bool(_cfg('TELEGRAM_LIVE_ONLY', True), default=True)
         self.message_mode = str(_cfg('TELEGRAM_MESSAGE_MODE', 'SHORT') or 'SHORT').strip().upper()
         self.parse_mode = str(_cfg('TELEGRAM_PARSE_MODE', 'HTML') or 'HTML').strip().upper()
@@ -129,6 +132,26 @@ class TelegramNotifier:
             return False
         bot_token, channel_id = self.resolve_credentials(user_id)
         return bool(bot_token and channel_id)
+
+    def resolve_cycle_summary_prefs(self, user_id: Optional[int] = None) -> Tuple[bool, str, str]:
+        enabled = self.cycle_summary_enabled_default
+        mode = self.cycle_summary_mode_default
+        channel_override = self.cycle_summary_channel_default
+        if has_app_context() and isinstance(user_id, int):
+            try:
+                from app.models.user import User
+                user = User.query.get(int(user_id))
+                if user is not None:
+                    enabled = bool(getattr(user, 'telegram_cycle_summary_enabled', enabled))
+                    mode = str(getattr(user, 'telegram_cycle_summary_mode', mode) or mode).strip().upper()
+                    override = str(getattr(user, 'telegram_cycle_summary_channel_id', '') or '').strip()
+                    if override:
+                        channel_override = override
+            except Exception:
+                pass
+        if mode not in ('SHORT', 'DETAILED'):
+            mode = 'SHORT'
+        return bool(enabled), mode, channel_override
 
     def notify_signal(self, signal: Dict[str, Any], mode: str = 'live', user_id: Optional[int] = None) -> Tuple[bool, str]:
         signal_mode = 'backtest' if str(mode or '').strip().lower() == 'backtest' else 'live'
@@ -274,6 +297,67 @@ class TelegramNotifier:
         if self.parse_mode == 'HTML':
             return self._build_html_message(signal, mode, user_id=user_id)
         return self._build_plain_text_message(signal, mode, user_id=user_id)
+
+    def _build_cycle_summary_message(self, summary: Dict[str, Any], mode: str = 'SHORT') -> str:
+        mode = str(mode or 'SHORT').strip().upper()
+        title = 'LIVE CYCLE COMPLETE'
+        tf = html_escape(str(summary.get('timeframe') or '-'))
+        multiplier = html_escape(self._fmt_num(summary.get('multiplier')))
+        duration = html_escape(self._fmt_num(summary.get('duration_seconds')))
+        stocks = html_escape(f"{summary.get('stocks_scanned', 0)}/{summary.get('stocks_total', 0)}")
+        strikes = html_escape(f"{summary.get('strikes_scanned', 0)}/{summary.get('strikes_total', 0)}")
+        signals = html_escape(str(summary.get('signals', 0)))
+        skipped = html_escape(str(summary.get('skipped_candles', 0)))
+        breakdown = summary.get('skip_breakdown') or {}
+        breakdown_text = (
+            f"Prefilter {breakdown.get('prefilter', 0)}, "
+            f"CMP {breakdown.get('cmp', 0)}, "
+            f"No Quote {breakdown.get('missing_quotes', 0)}, "
+            f"No Expiry {breakdown.get('missing_expiry', 0)}, "
+            f"No Spot {breakdown.get('missing_spot', 0)}, "
+            f"Fast Stocks {breakdown.get('fast_stocks', 0)}, "
+            f"Fast Strikes {breakdown.get('fast_strikes', 0)}"
+        )
+        breakdown_text = html_escape(breakdown_text)
+
+        if self.parse_mode == 'HTML':
+            if mode == 'SHORT':
+                return (
+                    f'<b>{title}</b>\n'
+                    f'TF: <b>{tf}</b> | Mult: <b>{multiplier}</b> | Dur: <b>{duration}s</b>\n'
+                    f'Stocks: <b>{stocks}</b> | Strikes: <b>{strikes}</b> | Signals: <b>{signals}</b>\n'
+                    f'Skip Candles: <b>{skipped}</b>'
+                )
+            return (
+                f'<b>{title}</b>\n'
+                f'Timeframe: <b>{tf}</b>\n'
+                f'Multiplier: <b>{multiplier}</b>\n'
+                f'Duration: <b>{duration}s</b>\n'
+                f'Stocks: <b>{stocks}</b>\n'
+                f'Strikes: <b>{strikes}</b>\n'
+                f'Signals: <b>{signals}</b>\n'
+                f'Skip Candles: <b>{skipped}</b>\n'
+                f'Skip Breakdown: {breakdown_text}'
+            )
+
+        if mode == 'SHORT':
+            return (
+                f'{title}\n'
+                f'TF: {tf} | Mult: {multiplier} | Dur: {duration}s\n'
+                f'Stocks: {stocks} | Strikes: {strikes} | Signals: {signals}\n'
+                f'Skip Candles: {skipped}'
+            )
+        return (
+            f'{title}\n'
+            f'Timeframe: {tf}\n'
+            f'Multiplier: {multiplier}\n'
+            f'Duration: {duration}s\n'
+            f'Stocks: {stocks}\n'
+            f'Strikes: {strikes}\n'
+            f'Signals: {signals}\n'
+            f'Skip Candles: {skipped}\n'
+            f'Skip Breakdown: {breakdown_text}'
+        )
 
     def _build_html_message(self, signal: Dict[str, Any], mode: str, user_id: Optional[int] = None) -> str:
         title = f'{mode.upper()} SIGNAL'
@@ -433,6 +517,46 @@ def send_signal_notification(signal: Dict[str, Any], mode: str = 'live', user_id
     except Exception as exc:
         logger.warning('Telegram notification error: %s', exc)
         return False
+
+
+def send_cycle_summary_notification(text: str, user_id: Optional[int] = None) -> Tuple[bool, str]:
+    """Send a live cycle summary message to Telegram without applying cooldown."""
+    try:
+        notifier = get_telegram_notifier()
+        signal_mode = 'live'
+        if not notifier.is_active_for_user(user_id):
+            return False, 'telegram_disabled_or_unconfigured'
+        if notifier.live_only and signal_mode != 'live':
+            return False, 'telegram_live_only'
+        if not notifier._user_notifications_enabled(user_id):
+            return False, 'notification_services_disabled'
+        enabled, mode, channel_override = notifier.resolve_cycle_summary_prefs(user_id)
+        if not enabled:
+            return False, 'cycle_summary_disabled'
+
+        bot_token, channel_id = notifier.resolve_credentials(user_id)
+        if channel_override:
+            channel_id = channel_override
+        endpoint = f'https://api.telegram.org/bot{bot_token}/sendMessage'
+        if isinstance(text, dict):
+            message = notifier._build_cycle_summary_message(text, mode=mode)
+        else:
+            message = str(text or '')
+        payload = {
+            'chat_id': channel_id,
+            'text': message,
+            'disable_web_page_preview': True
+        }
+        if notifier.parse_mode in ('HTML', 'MARKDOWN', 'MARKDOWNV2'):
+            payload['parse_mode'] = notifier.parse_mode
+
+        response = notifier._session.post(endpoint, json=payload, timeout=10)
+        body = response.json() if response.content else {}
+        if response.status_code == 200 and bool(body.get('ok', False)):
+            return True, 'sent'
+        return False, f'http_{response.status_code}'
+    except Exception as exc:
+        return False, f'exception:{exc}'
 
 
 def send_test_notification(text: str, user_id: Optional[int] = None) -> Tuple[bool, str, Optional[Dict[str, Any]]]:

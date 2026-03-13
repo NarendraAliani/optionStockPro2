@@ -625,7 +625,9 @@ class AngelOneAPI:
                 option_type = option_type.upper()
 
                 expiry = self._parse_expiry(item.get('expiry'))
-                strike = self._normalize_strike(item.get('strike'))
+                strike = self._extract_strike_from_contract_symbol(symbol)
+                if strike is None:
+                    strike = self._normalize_strike(item.get('strike'))
                 token = item.get('token') or item.get('symboltoken')
                 if not (name and expiry and strike and token):
                     continue
@@ -778,12 +780,13 @@ class AngelOneAPI:
             if not option_type and not (symbol.endswith('CE') or symbol.endswith('PE')):
                 continue
 
-            strike = self._normalize_strike(item.get('strike'))
+            strike = self._extract_strike_from_contract_symbol(symbol)
+            if strike is None:
+                strike = self._normalize_strike(item.get('strike'))
             if strike is None:
                 continue
 
-            # Some masters store strikes scaled by 100.
-            candidate = strike / 100.0 if strike > 100000 else strike
+            candidate = strike
             strikes.add(round(float(candidate), 2))
 
         result = sorted(strikes)
@@ -835,6 +838,24 @@ class AngelOneAPI:
         except Exception:
             return None
 
+    def _extract_strike_from_contract_symbol(self, symbol):
+        if not symbol:
+            return None
+        text = str(symbol).strip().upper()
+        match = re.match(r'^(.*?)(\d{2})([A-Z]{3})(\d{2})(\d+(?:\.\d+)?)(CE|PE)$', text)
+        if match:
+            try:
+                return round(float(match.group(5)), 2)
+            except Exception:
+                return None
+        fallback = re.search(r'(\d+(?:\.\d+)?)(CE|PE)$', text)
+        if not fallback:
+            return None
+        try:
+            return round(float(fallback.group(1)), 2)
+        except Exception:
+            return None
+
     def _strike_matches(self, candidate, target):
         if candidate is None:
             return False
@@ -843,7 +864,11 @@ class AngelOneAPI:
         # try scaled variants seen in some master files
         if abs((candidate / 100) - target) < 0.01:
             return True
+        if abs((candidate / 10) - target) < 0.01:
+            return True
         if abs((candidate * 100) - target) < 0.01:
+            return True
+        if abs((candidate * 10) - target) < 0.01:
             return True
         return False
 
@@ -1321,6 +1346,10 @@ class AngelOneAPI:
         now = self._ensure_market_time(now)
         interval = max(1, int(interval_minutes))
         bucket_minute = (now.minute // interval) * interval
+        # Live scan uses candle timestamps as the closed-candle label.
+        # Example for 15m:
+        #   13:40 scan -> current closed candle label 13:30, previous 13:15
+        #   13:46 scan -> current closed candle label 13:45, previous 13:30
         latest_start = now.replace(minute=bucket_minute, second=0, microsecond=0)
         previous_start = latest_start - timedelta(minutes=interval)
         return latest_start, previous_start

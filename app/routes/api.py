@@ -489,6 +489,37 @@ def download_latest_backtest_log():
     )
 
 
+@api_bp.route('/live/logs/latest-csv', methods=['GET'])
+@login_required
+def download_latest_live_log_csv():
+    """Download latest live cycle CSV log for current user."""
+    logs_dir = Path('logs')
+    if not logs_dir.exists() or not logs_dir.is_dir():
+        return jsonify({'success': False, 'error': 'Log directory not found.'}), 404
+
+    prefix = f'live_scan_cycle_user_{current_user.id}_'
+    candidates = []
+    for path in logs_dir.iterdir():
+        if not path.is_file():
+            continue
+        if not path.name.startswith(prefix) or not path.name.endswith('.csv'):
+            continue
+        candidates.append(path)
+
+    if not candidates:
+        return jsonify({'success': False, 'error': 'No live cycle CSV log file found for this user yet.'}), 404
+
+    latest = max(candidates, key=lambda p: p.stat().st_mtime).resolve()
+    if not latest.exists():
+        return jsonify({'success': False, 'error': 'Latest live cycle CSV log file was not found on disk.'}), 404
+    return send_file(
+        latest,
+        as_attachment=True,
+        download_name=latest.name,
+        mimetype='text/csv'
+    )
+
+
 @api_bp.route('/backtest/logs/latest-csv', methods=['GET'])
 @login_required
 def download_latest_backtest_log_csv():

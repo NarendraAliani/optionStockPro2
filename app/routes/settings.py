@@ -558,6 +558,11 @@ def preferences():
         guardrail_load_threshold = _clamp_int(request.form.get('guardrail_load_threshold'), 100, 25000, 1200)
         backtest_scan_log_enabled = _form_bool(request.form, 'backtest_scan_log_enabled', default=False)
         api_error_log_enabled = _form_bool(request.form, 'api_error_log_enabled', default=False)
+        telegram_cycle_summary_enabled = _form_bool(request.form, 'telegram_cycle_summary_enabled', default=True)
+        telegram_cycle_summary_mode = str(request.form.get('telegram_cycle_summary_mode', 'short') or 'short').strip().lower()
+        if telegram_cycle_summary_mode not in ('short', 'detailed'):
+            telegram_cycle_summary_mode = 'short'
+        telegram_cycle_summary_channel_id = str(request.form.get('telegram_cycle_summary_channel_id', '') or '').strip()
         current_user.theme_preference = theme
         current_user.scan_workers = scan_workers
         current_user.live_workers_cap = live_workers_cap
@@ -580,6 +585,9 @@ def preferences():
         current_user.guardrail_load_threshold = guardrail_load_threshold
         current_user.backtest_scan_log_enabled = backtest_scan_log_enabled
         current_user.api_error_log_enabled = api_error_log_enabled
+        current_user.telegram_cycle_summary_enabled = telegram_cycle_summary_enabled
+        current_user.telegram_cycle_summary_mode = telegram_cycle_summary_mode
+        current_user.telegram_cycle_summary_channel_id = telegram_cycle_summary_channel_id
         db.session.commit()
         flash('Preferences updated!', 'success')
         return redirect(url_for('dashboard.index'))

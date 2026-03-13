@@ -4,7 +4,7 @@ Scanner Engine Service
 from app.services.angel_api import AngelOneAPI
 from app.services.signal_detector import SignalDetector
 from app.services.data_processor import DataProcessor
-from app.services.telegram_notifier import send_signal_notification
+from app.services.telegram_notifier import send_signal_notification, send_cycle_summary_notification
 from app.services.live_scan_jobs import scan_live_symbol_job
 from app.models.signal import Signal
 from app.models.signal_detail import SignalDetail
@@ -137,6 +137,8 @@ class ScannerEngine:
         self._backtest_csv_handle = None
         self._backtest_csv_writer = None
         self._backtest_csv_path = None
+        self._latest_live_cycle_log_path = None
+        self._latest_live_cycle_log_generated_at = None
         self._api_error_log_enabled = bool(api_error_log_enabled)
         self._api_error_log_lock = Lock()
         self._cmp_min = float(os.getenv('LIVE_CMP_MIN', '200') or 200)
@@ -187,12 +189,14 @@ class ScannerEngine:
                 if self._wait_with_abort(min(refresh_interval, 10)):
                     break
                 continue
+            cycle_started_at = datetime.utcnow()
             try:
                 signals = self.scan_once(
                     progress_callback=status_callback,
                     reference_time=candle_slot,
                     emit_signals=True
                 )
+                cycle_duration_s = max(0.0, (datetime.utcnow() - cycle_started_at).total_seconds())
                 if status_callback:
                     status_callback(
                         self.user_id,
@@ -213,6 +217,10 @@ class ScannerEngine:
                         fast_strike_skipped=self.last_cycle_fast_strike_skipped,
                         strikes_planned=self.last_cycle_strikes_planned
                     )
+                self._notify_live_cycle_summary(
+                    signals_count=len(signals),
+                    duration_seconds=cycle_duration_s
+                )
                 self._log_api_activity('live')
             except Exception as e:
                 logger.error(f'Live scan error: {str(e)}')
@@ -342,7 +350,14 @@ class ScannerEngine:
         self.last_cycle_cmp_skipped += self._safe_int(cmp_skipped, 0)
 
         detected = []
+        cycle_log_rows = []
         if not symbol_jobs:
+            self._write_live_cycle_scan_csv(
+                rows=[],
+                cycle_time=cycle_time,
+                signals_count=0,
+                duration_seconds=0.0
+            )
             return detected
 
         if self._live_use_queue is None:
@@ -411,16 +426,20 @@ class ScannerEngine:
                     symbol_detected = []
                     strikes_scanned = 0
                     skipped_candles = 0
+                    cycle_rows = []
                     try:
                         result = job.result or ()
                         if isinstance(result, tuple):
                             symbol_detected = result[0] or []
                             strikes_scanned = self._safe_int(result[1], 0) if len(result) > 1 else 0
                             skipped_candles = self._safe_int(result[2], 0) if len(result) > 2 else 0
+                            cycle_rows = result[3] or [] if len(result) > 3 else []
                         else:
                             symbol_detected = result or []
                     except Exception:
                         pass
+                    if cycle_rows:
+                        cycle_log_rows.extend(cycle_rows)
                     self.last_cycle_strikes_scanned += self._safe_int(strikes_scanned, 0)
                     self.last_cycle_skipped_candles += self._safe_int(skipped_candles, 0)
                     if symbol_detected:
@@ -479,16 +498,20 @@ class ScannerEngine:
                     symbol_detected = []
                     strikes_scanned = 0
                     skipped_candles = 0
+                    cycle_rows = []
                     try:
                         result = future.result()
                         if isinstance(result, tuple):
                             symbol_detected = result[0] or []
                             strikes_scanned = self._safe_int(result[1], 0) if len(result) > 1 else 0
                             skipped_candles = self._safe_int(result[2], 0) if len(result) > 2 else 0
+                            cycle_rows = result[3] or [] if len(result) > 3 else []
                         else:
                             symbol_detected = result or []
                     except Exception as e:
                         logger.error('Live scan worker failed for %s: %s', future_map.get(future), str(e))
+                    if cycle_rows:
+                        cycle_log_rows.extend(cycle_rows)
                     self.last_cycle_strikes_scanned += self._safe_int(strikes_scanned, 0)
                     self.last_cycle_skipped_candles += self._safe_int(skipped_candles, 0)
                     if symbol_detected:
@@ -528,6 +551,13 @@ class ScannerEngine:
             else:
                 self.last_cycle_skip_reason = 'partial_missing'
 
+        self._write_live_cycle_scan_csv(
+            rows=cycle_log_rows,
+            cycle_time=cycle_time,
+            signals_count=len(detected),
+            duration_seconds=0.0
+        )
+
         return detected
 
     def _emit_live_signal(self, signal):
@@ -537,6 +567,41 @@ class ScannerEngine:
             send_signal_notification(payload, mode='live', user_id=self.user_id)
         except Exception:
             pass
+
+    def _notify_live_cycle_summary(self, signals_count=0, duration_seconds=0.0):
+        try:
+            duration = max(0.0, float(duration_seconds or 0.0))
+        except Exception:
+            duration = 0.0
+        try:
+            tf = self._normalize_timeframe()
+        except Exception:
+            tf = self.config.timeframe
+        try:
+            multiplier = float(self.config.price_multiplier or 0)
+        except Exception:
+            multiplier = 0.0
+        summary = {
+            'timeframe': f'{tf}m',
+            'multiplier': multiplier,
+            'duration_seconds': round(duration, 1),
+            'stocks_scanned': int(self.last_cycle_stocks_scanned or 0),
+            'stocks_total': int(self.last_cycle_stocks_total or 0),
+            'strikes_scanned': int(self.last_cycle_strikes_scanned or 0),
+            'strikes_total': int(self.last_cycle_strikes_total or 0),
+            'signals': int(signals_count or 0),
+            'skipped_candles': int(self.last_cycle_skipped_candles or 0),
+            'skip_breakdown': {
+                'prefilter': int(self.last_cycle_prefilter_skipped or 0),
+                'cmp': int(self.last_cycle_cmp_skipped or 0),
+                'missing_quotes': int(self.last_cycle_missing_quotes or 0),
+                'missing_expiry': int(self.last_cycle_missing_expiry or 0),
+                'missing_spot': int(self.last_cycle_missing_spot or 0),
+                'fast_stocks': int(self.last_cycle_fast_stock_skipped or 0),
+                'fast_strikes': int(self.last_cycle_fast_strike_skipped or 0)
+            }
+        }
+        send_cycle_summary_notification(summary, user_id=self.user_id)
 
     def run_backtest(self, from_date, to_date, progress_callback=None):
         """
@@ -649,15 +714,16 @@ class ScannerEngine:
 
     def _scan_live_symbol(self, symbol, expiry, strikes_by_type, timeframe, spot_price=None):
         if not self.is_running or self._stop_event.is_set() or not expiry:
-            return [], 0, 0
+            return [], 0, 0, []
 
         strikes_processed = 0
         skipped_candles = 0
         symbol_detected = []
+        cycle_rows = []
         for option_type in ('CE', 'PE'):
             for strike in strikes_by_type.get(option_type, []):
                 if not self.is_running or self._stop_event.is_set():
-                    return symbol_detected, strikes_processed, skipped_candles
+                    return symbol_detected, strikes_processed, skipped_candles, cycle_rows
                 strikes_processed += 1
                 option_snapshot = self.angel_api.get_recent_option_candle_pair(
                     underlying=symbol,
@@ -689,6 +755,12 @@ class ScannerEngine:
                             'api_last_error': getattr(self.angel_api, 'last_error', None)
                         }
                     )
+                    cycle_rows.append(self._live_cycle_log_row(
+                        symbol=symbol,
+                        strike=strike,
+                        option_type=option_type,
+                        option_snapshot=None
+                    ))
                     continue
 
                 signal_payload = {
@@ -706,6 +778,12 @@ class ScannerEngine:
                     'rsi': option_snapshot.get('rsi')
                 }
                 signal = SignalDetector.detect_signal(signal_payload, self.config)
+                cycle_rows.append(self._live_cycle_log_row(
+                    symbol=symbol,
+                    strike=strike,
+                    option_type=option_type,
+                    option_snapshot=option_snapshot
+                ))
                 if not signal:
                     continue
                 signal['strike_price'] = self._normalize_signal_strike(
@@ -721,7 +799,61 @@ class ScannerEngine:
                 signal['detected_at'] = candle_time or datetime.utcnow()
                 signal['displayed_at'] = datetime.utcnow()
                 symbol_detected.append(signal)
-        return symbol_detected, strikes_processed, skipped_candles
+        return symbol_detected, strikes_processed, skipped_candles, cycle_rows
+
+    def _live_cycle_csv_fields(self):
+        return [
+            'Current Candle Time',
+            'Stock',
+            'Strike',
+            'Type',
+            'Prev Close',
+            'Current Close',
+            'Open',
+            'High',
+            'Low',
+            'Close'
+        ]
+
+    def _live_cycle_log_row(self, symbol, strike, option_type, option_snapshot=None):
+        snapshot = option_snapshot or {}
+        candle_time = snapshot.get('candle_time')
+        if isinstance(candle_time, datetime):
+            candle_time = candle_time.isoformat()
+        return {
+            'Current Candle Time': candle_time or '',
+            'Stock': str(snapshot.get('symbol') or symbol or ''),
+            'Strike': self._normalize_signal_strike(snapshot.get('strike_price', strike), symbol),
+            'Type': str(snapshot.get('option_type') or option_type or ''),
+            'Prev Close': snapshot.get('previous_candle_close', ''),
+            'Current Close': snapshot.get('current_candle_close', ''),
+            'Open': snapshot.get('current_candle_open', ''),
+            'High': snapshot.get('current_candle_high', ''),
+            'Low': snapshot.get('current_candle_low', ''),
+            'Close': snapshot.get('current_candle_close', '')
+        }
+
+    def _write_live_cycle_scan_csv(self, rows, cycle_time=None, signals_count=0, duration_seconds=0.0):
+        try:
+            os.makedirs('logs', exist_ok=True)
+            stamp_source = cycle_time if isinstance(cycle_time, datetime) else datetime.utcnow()
+            stamp = stamp_source.strftime('%Y%m%d_%H%M%S')
+            file_name = f'live_scan_cycle_user_{self.user_id}_{stamp}.csv'
+            file_path = os.path.join('logs', file_name)
+            with open(file_path, 'w', newline='', encoding='utf-8') as handle:
+                writer = csv.DictWriter(handle, fieldnames=self._live_cycle_csv_fields())
+                writer.writeheader()
+                for row in rows or []:
+                    source = row or {}
+                    clean_row = {field: source.get(field, '') for field in self._live_cycle_csv_fields()}
+                    writer.writerow(clean_row)
+                handle.flush()
+            self._latest_live_cycle_log_path = file_path
+            self._latest_live_cycle_log_generated_at = datetime.utcnow().isoformat() + 'Z'
+        except Exception as e:
+            logger.error('Failed to write live cycle CSV log: %s', str(e))
+            self._latest_live_cycle_log_path = None
+            self._latest_live_cycle_log_generated_at = None
 
     def _run_backtest_symbol(self, symbol, from_date, to_date, timeframe):
         if not self.is_running or self._stop_event.is_set():
@@ -2168,6 +2300,8 @@ class ScannerEngine:
         now = self._market_now()
         interval = max(1, self._safe_int(timeframe_minutes, 5))
         bucket_minute = (now.minute // interval) * interval
+        # The claimed slot is the latest closed candle label, not the next bucket.
+        # This keeps live scans aligned with fully closed candles across timeframes.
         current_bucket = now.replace(minute=bucket_minute, second=0, microsecond=0)
         close_ready_at = current_bucket + timedelta(seconds=max(0, self._candle_close_delay_seconds))
         if now < close_ready_at:

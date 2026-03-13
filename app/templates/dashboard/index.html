@@ -397,12 +397,15 @@
     let backtestObservedStrikesTotal = 0;
     let backtestObservedSignals = 0;
     let lastBacktestOutcomeToken = '';
+    let lastLiveCyclePromptToken = '';
     let unseenSignalCount = 0;
     let titleFlashTimer = null;
     let titleFlashOn = false;
     let signalCardPulseTimer = null;
     let lastRealtimeSignalAt = 0;
     let lastLiveStatus = null;
+    const signalSeenKeys = { live: new Set(), backtest: new Set() };
+    let lastSignalsFullRefreshAt = 0;
     const displayedAtCache = {};
     const ohlcBackfillRequested = { live: false, backtest: false };
     let ohlcBackfillInProgress = false;
@@ -449,8 +452,10 @@
         setInterval(refreshSignalCounts, 10000);
 
         // Load recent signals and poll for updates
-        loadRecentSignals();
-        setInterval(loadRecentSignals, 10000);
+        loadRecentSignals(null, true);
+        setInterval(function() {
+            loadRecentSignals();
+        }, 2000);
 
         $('#btnModeLive').on('click', function() {
             setSignalsMode('live');
@@ -522,6 +527,9 @@
         if (typeof io !== 'function') return;
         try {
             socketClient = io();
+            socketClient.on('connect', function() {
+                loadRecentSignals(currentSignalsMode, false);
+            });
             socketClient.on('new_signal', function(signal) {
                 const payload = signal || {};
                 const mode = String(payload.mode || 'live').toLowerCase() === 'backtest' ? 'backtest' : 'live';
@@ -529,8 +537,9 @@
                 if (mode === 'backtest' && !backtestRunning && !backtestStartPending) return;
 
                 lastRealtimeSignalAt = Date.now();
+                const appended = addSignalRowRealtime(mode, payload);
+                if (!appended) return;
                 triggerSignalAttention(mode, payload, 1);
-                addSignalRowRealtime(mode, payload);
                 refreshSignalCounts();
             });
             socketClient.on('backtest_progress', function(progress) {
@@ -1506,8 +1515,49 @@
         return url;
     }
 
-    function loadRecentSignals(mode) {
+    function signalIdentityKey(mode, signal) {
+        const payload = signal || {};
+        return [
+            String(mode || ''),
+            String(payload.id != null ? payload.id : ''),
+            String(payload.symbol || ''),
+            String(payload.option_type || ''),
+            String(payload.strike_price != null ? payload.strike_price : ''),
+            String(payload.detected_at || '')
+        ].join('::');
+    }
+
+    function rebuildSignalSeenKeys(mode, signals) {
+        signalSeenKeys[mode] = new Set();
+        (signals || []).forEach(function(signal) {
+            signalSeenKeys[mode].add(signalIdentityKey(mode, signal));
+        });
+    }
+
+    function replaceSignalRows(mode, signals) {
+        const table = mode === 'backtest' ? backtestSignalsTable : liveSignalsTable;
+        if (!table) return;
+        const rows = (signals || []).map(function(signal) {
+            return signalToRow(signal, mode);
+        });
+        table.clear();
+        table.rows.add(rows).draw();
+        rebuildSignalSeenKeys(mode, signals || []);
+    }
+
+    function mergeSignalRows(mode, signals) {
+        (signals || []).slice().reverse().forEach(function(signal) {
+            addSignalRowRealtime(mode, signal);
+        });
+    }
+
+    function loadRecentSignals(mode, forceReplace) {
         const modes = mode ? [mode] : ['live', 'backtest'];
+        const now = Date.now();
+        const shouldForceReplace = forceReplace === true || (now - lastSignalsFullRefreshAt) >= 30000;
+        if (shouldForceReplace) {
+            lastSignalsFullRefreshAt = now;
+        }
         modes.forEach(function(targetMode) {
             $.ajax({
                 url: _signalsUrlForMode(targetMode),
@@ -1517,13 +1567,11 @@
                     const table = targetMode === 'backtest' ? backtestSignalsTable : liveSignalsTable;
                     if (!response.success || !table) return;
                     const signals = response.signals || [];
-
-                    const rows = signals.map(function(signal) {
-                        return signalToRow(signal, targetMode);
-                    });
-
-                    table.clear();
-                    table.rows.add(rows).draw();
+                    if (shouldForceReplace || !signalSeenKeys[targetMode] || signalSeenKeys[targetMode].size === 0) {
+                        replaceSignalRows(targetMode, signals);
+                    } else {
+                        mergeSignalRows(targetMode, signals);
+                    }
                     maybeBackfillOhlc(targetMode, signals);
                 }
             });
@@ -1546,7 +1594,7 @@
         requestOhlcBackfill(mode, 400)
             .done(function(response) {
                 if (response && response.success && Number(response.updated || 0) > 0) {
-                    loadRecentSignals(mode);
+                    loadRecentSignals(mode, true);
                 }
             })
             .fail(function() {
@@ -1584,7 +1632,7 @@
                         'Skipped: ' + (response.skipped || 0) + '\n' +
                         'Failed: ' + (response.failed || 0)
                     );
-                    loadRecentSignals();
+                    loadRecentSignals(null, true);
                 } else {
                     const msg = (response && response.error) ? response.error : 'Backfill failed.';
                     alert('Backfill error: ' + msg);
@@ -1688,8 +1736,17 @@
 
     function addSignalRowRealtime(mode, signal) {
         const table = mode === 'backtest' ? backtestSignalsTable : liveSignalsTable;
-        if (!table) return;
+        if (!table) return false;
+        const key = signalIdentityKey(mode, signal);
+        if (signalSeenKeys[mode] && signalSeenKeys[mode].has(key)) {
+            return false;
+        }
+        if (!signalSeenKeys[mode]) {
+            signalSeenKeys[mode] = new Set();
+        }
+        signalSeenKeys[mode].add(key);
         table.row.add(signalToRow(signal, mode)).draw(false);
+        return true;
     }
 
     function parseUtcDate(value) {
@@ -1833,6 +1890,9 @@
         }
 
         if (type === 'live') {
+            const hadPreviousLiveStatus = !!lastLiveStatus;
+            const previousLiveLastRunAt = lastLiveStatus ? String(lastLiveStatus.last_run_at || '') : '';
+            const previousLiveLogGeneratedAt = lastLiveStatus ? String(lastLiveStatus.latest_live_cycle_log_generated_at || '') : '';
             lastLiveStatus = data || null;
             if (liveStatusConfirmTimer) {
                 clearTimeout(liveStatusConfirmTimer);
@@ -1971,6 +2031,7 @@
                     .html('2. Get Live Stocks')
                     .prop('disabled', !liveAuthReady);
             }
+            maybePromptLiveCycleLogDownload(data, hadPreviousLiveStatus, previousLiveLastRunAt, previousLiveLogGeneratedAt);
         }
 
         if (type === 'backtest') {
@@ -2147,7 +2208,7 @@
         $('#btnModeBacktest').toggleClass('active', currentSignalsMode === 'backtest');
         $('#liveSignalsWrap').toggleClass('d-none', currentSignalsMode !== 'live');
         $('#backtestSignalsWrap').toggleClass('d-none', currentSignalsMode !== 'backtest');
-        loadRecentSignals(currentSignalsMode);
+        loadRecentSignals(currentSignalsMode, true);
     }
 
     function exportSignalsCsv() {
@@ -2220,6 +2281,80 @@
         } finally {
             btn.prop('disabled', false).html(originalHtml);
         }
+    }
+
+    async function downloadLatestLiveCycleCsv() {
+        const urls = [
+            '/api/live/logs/latest-csv?t=' + Date.now(),
+            '/scanner/api/live/logs/latest-csv?t=' + Date.now()
+        ];
+
+        for (let i = 0; i < urls.length; i += 1) {
+            const response = await fetch(urls[i], { method: 'GET', credentials: 'same-origin' });
+            if (!response.ok) {
+                if (response.status === 404) {
+                    continue;
+                }
+                let message = 'Failed to download live cycle CSV log. HTTP ' + response.status + '.';
+                try {
+                    const payload = await response.json();
+                    if (payload && payload.error) {
+                        message = payload.error;
+                    }
+                } catch (e) {}
+                throw new Error(message);
+            }
+
+            const blob = await response.blob();
+            const cd = response.headers.get('Content-Disposition') || '';
+            let filename = 'live_scan_cycle_latest.csv';
+            const match = cd.match(/filename=\"?([^\";]+)\"?/i);
+            if (match && match[1]) {
+                filename = match[1];
+            }
+            const link = document.createElement('a');
+            const objectUrl = URL.createObjectURL(blob);
+            link.href = objectUrl;
+            link.download = filename;
+            document.body.appendChild(link);
+            link.click();
+            link.remove();
+            URL.revokeObjectURL(objectUrl);
+            return;
+        }
+
+        throw new Error('No live cycle CSV log file found yet for this user.');
+    }
+
+    function maybePromptLiveCycleLogDownload(data, hadPreviousLiveStatus, previousLiveLastRunAt, previousLiveLogGeneratedAt) {
+        const cycleRunAt = String((data || {}).last_run_at || '');
+        const logGeneratedAt = String((data || {}).latest_live_cycle_log_generated_at || '');
+        const hasLog = !!((data || {}).latest_live_cycle_log);
+        if (!liveScannerRunning || !cycleRunAt || !logGeneratedAt || !hasLog || !hadPreviousLiveStatus) {
+            return;
+        }
+        const isNewCycle = cycleRunAt !== String(previousLiveLastRunAt || '');
+        const isNewLog = logGeneratedAt !== String(previousLiveLogGeneratedAt || '');
+        if (!isNewCycle && !isNewLog) {
+            return;
+        }
+
+        const promptToken = cycleRunAt + '|' + logGeneratedAt;
+        if (promptToken === lastLiveCyclePromptToken) {
+            return;
+        }
+        lastLiveCyclePromptToken = promptToken;
+
+        const shouldDownload = window.confirm(
+            'Stocks scanned cycle completed. Live cycle log file is ready with candle fields. Do you want to download and save it now?'
+        );
+        if (!shouldDownload) {
+            return;
+        }
+
+        downloadLatestLiveCycleCsv().catch(function(error) {
+            alert((error && error.message) ? error.message : 'Failed to download live cycle CSV log.');
+        });
     }
 
     async function downloadLatestBacktestCsv() {

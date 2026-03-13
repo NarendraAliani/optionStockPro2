@@ -21,7 +21,26 @@ class _DummyConfig:
         self.timeframe = timeframe
 
 
-def scan_live_symbol_job(payload: Dict[str, Any]) -> Tuple[list, int, int]:
+def _build_live_cycle_log_row(symbol: str, strike: Any, option_type: str, option_snapshot: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    snapshot = option_snapshot or {}
+    candle_time = snapshot.get('candle_time')
+    if isinstance(candle_time, datetime):
+        candle_time = candle_time.isoformat()
+    return {
+        'Current Candle Time': candle_time or '',
+        'Stock': str(snapshot.get('symbol') or symbol or ''),
+        'Strike': snapshot.get('strike_price', strike),
+        'Type': str(snapshot.get('option_type') or option_type or ''),
+        'Prev Close': snapshot.get('previous_candle_close', ''),
+        'Current Close': snapshot.get('current_candle_close', ''),
+        'Open': snapshot.get('current_candle_open', ''),
+        'High': snapshot.get('current_candle_high', ''),
+        'Low': snapshot.get('current_candle_low', ''),
+        'Close': snapshot.get('current_candle_close', '')
+    }
+
+
+def scan_live_symbol_job(payload: Dict[str, Any]) -> Tuple[list, int, int, list]:
     """
     Job payload keys:
       user_id, symbol, expiry, strikes_by_type, timeframe, price_multiplier, spot_price
@@ -83,11 +102,12 @@ def scan_live_symbol_job(payload: Dict[str, Any]) -> Tuple[list, int, int]:
         strikes_processed = 0
         skipped = 0
         detected = []
+        cycle_rows = []
 
         for option_type in ('CE', 'PE'):
             for strike in strikes_by_type.get(option_type, []):
                 if is_live_stop_requested(user_id):
-                    return detected, strikes_processed, skipped
+                    return detected, strikes_processed, skipped, cycle_rows
                 strikes_processed += 1
                 option_snapshot = angel_api.get_recent_option_candle_pair(
                     underlying=symbol,
@@ -99,6 +119,7 @@ def scan_live_symbol_job(payload: Dict[str, Any]) -> Tuple[list, int, int]:
                 )
                 if not option_snapshot:
                     skipped += 1
+                    cycle_rows.append(_build_live_cycle_log_row(symbol, strike, option_type, None))
                     continue
 
                 signal_payload = {
@@ -115,6 +136,7 @@ def scan_live_symbol_job(payload: Dict[str, Any]) -> Tuple[list, int, int]:
                     'open_interest': option_snapshot.get('open_interest', 0),
                     'rsi': option_snapshot.get('rsi')
                 }
+                cycle_rows.append(_build_live_cycle_log_row(symbol, strike, option_type, option_snapshot))
                 signal = SignalDetector.detect_signal(signal_payload, config)
                 if not signal:
                     continue
@@ -125,4 +147,4 @@ def scan_live_symbol_job(payload: Dict[str, Any]) -> Tuple[list, int, int]:
                     signal['spot_price'] = float(spot_price)
                 detected.append(signal)
 
-        return detected, strikes_processed, skipped
+        return detected, strikes_processed, skipped, cycle_rows

@@ -434,7 +434,10 @@ def _build_angel_api(creds, mode='live', totp_code=None):
     api_key_legacy = EncryptionHelper.decrypt(creds.api_key_encrypted) if creds.api_key_encrypted else None
 
     if mode == 'backtest':
-        api_key = api_key_historical or api_key_market or api_key_legacy
+        # Backtests scan NFO option candles. In practice, the market key is often
+        # the one that returns option history correctly, while a historical-only
+        # key may authenticate but return empty candle sets.
+        api_key = api_key_market or api_key_legacy or api_key_historical
     else:
         api_key = api_key_market or api_key_legacy or api_key_historical
 
@@ -588,6 +591,8 @@ def start_live_scan(app, user_id, config_data):
                 'auto_tune': bool(tune_detail.get('enabled')),
                 'auto_tune_summary': tune_detail.get('summary'),
                 'auto_tune_details': tune_detail,
+                'latest_live_cycle_log': None,
+                'latest_live_cycle_log_generated_at': None,
                 'recent_cycles': list(previous_status.get('recent_cycles') or [])[:10],
                 'cycle_started_at': None
             }
@@ -987,6 +992,7 @@ def _update_live_status(
         status = _scanner_status.get(user_id)
         if not status:
             return
+        engine = _live_scanners.get(user_id)
         if (
             bool(status.get('running'))
             and stocks_scanned is not None
@@ -1033,6 +1039,8 @@ def _update_live_status(
             # Clear previous error after a successful cycle update.
             status['last_error'] = None
         if last_run_at:
+            status['latest_live_cycle_log'] = getattr(engine, '_latest_live_cycle_log_path', None) if engine else status.get('latest_live_cycle_log')
+            status['latest_live_cycle_log_generated_at'] = getattr(engine, '_latest_live_cycle_log_generated_at', None) if engine else status.get('latest_live_cycle_log_generated_at')
             started = _parse_iso_utc(status.get('cycle_started_at')) or _parse_iso_utc(status.get('started_at'))
             finished = _parse_iso_utc(last_run_at) or datetime.utcnow()
             duration_ms = 0

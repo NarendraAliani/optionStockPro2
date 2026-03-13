@@ -39,19 +39,6 @@ class SignalDetector:
             if previous_close <= 0.20 or current_price <= 0.20:
                 return None
 
-            min_volume = 10
-            try:
-                min_volume = int(getattr(config, 'min_signal_volume', 10) or 10)
-            except Exception:
-                min_volume = 10
-            volume = 0
-            try:
-                volume = int(option_data.get('volume', 0) or 0)
-            except Exception:
-                volume = 0
-            if volume < max(0, min_volume):
-                return None
-
             # Calculate price change percentage
             price_change = (current_price - previous_close) / previous_close
             price_change_percent = price_change * 100
@@ -63,8 +50,8 @@ class SignalDetector:
             upper = previous_close * threshold
 
             # Only bullish multiplier breakout:
-            # next candle close must be strictly greater than previous close * multiplier.
-            if current_price > upper:
+            # next candle close must be greater than or equal to previous close * multiplier.
+            if current_price >= upper:
                 return {
                     'symbol': option_data['symbol'],
                     'option_type': option_data['option_type'],
