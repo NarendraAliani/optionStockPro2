@@ -9,6 +9,7 @@ from app.services.live_scan_jobs import scan_live_symbol_job
 from app.models.signal import Signal
 from app.models.signal_detail import SignalDetail
 from app import db, socketio
+from flask import current_app, has_app_context
 from datetime import datetime, date, timezone, timedelta, time as dt_time
 from collections import OrderedDict
 import time
@@ -120,8 +121,10 @@ class ScannerEngine:
         self._live_fast_cursor = 0
         self._candle_close_delay_seconds = self._safe_int(os.getenv('LIVE_CANDLE_CLOSE_DELAY_SECONDS', '8'), 8)
         self.max_workers = max(1, min(16, self._safe_int(workers, 8)))
+        self._flask_app = current_app._get_current_object() if has_app_context() else None
         self._stop_event = Event()
         self._live_signal_lock = Lock()
+        self._backtest_signal_count_lock = Lock()
         freq_token = str(backtest_rebalance_frequency or 'weekly').strip().lower()
         if freq_token not in ('daily', 'weekly', 'monthly'):
             freq_token = 'weekly'
@@ -856,6 +859,10 @@ class ScannerEngine:
             self._latest_live_cycle_log_generated_at = None
 
     def _run_backtest_symbol(self, symbol, from_date, to_date, timeframe):
+        if self._flask_app is not None and not has_app_context():
+            with self._flask_app.app_context():
+                return self._run_backtest_symbol(symbol, from_date, to_date, timeframe)
+
         if not self.is_running or self._stop_event.is_set():
             return [], 0, 0, 0, 0
 
@@ -1294,13 +1301,42 @@ class ScannerEngine:
 
                             # Persist and emit immediately for backtest.
                             try:
-                                self._persist_signals([signal], mode='backtest')
-                                self.last_backtest_signals += 1
-                                payload = self._serialize_realtime_signal(signal)
-                                socketio.emit('new_signal', payload, to=f'user_{self.user_id}')
-                                send_signal_notification(payload, mode='backtest', user_id=self.user_id)
-                            except Exception:
-                                pass
+                                persisted_count = self._persist_signals([signal], mode='backtest')
+                                if persisted_count:
+                                    with self._backtest_signal_count_lock:
+                                        self.last_backtest_signals += int(persisted_count)
+                                    payload = self._serialize_realtime_signal(signal)
+                                    socketio.emit('new_signal', payload, to=f'user_{self.user_id}')
+                                    send_signal_notification(payload, mode='backtest', user_id=self.user_id)
+                                else:
+                                    persist_error = str(getattr(self, '_last_signal_persist_error', '') or 'unknown_persist_error')
+                                    self._write_backtest_scan_log(
+                                        'persist_signal_failed',
+                                        {
+                                            'symbol': signal.get('symbol'),
+                                            'instrument_symbol': signal.get('symbol'),
+                                            'option_type': signal.get('option_type'),
+                                            'strike': signal.get('strike_price'),
+                                            'detected_at': signal.get('detected_at').isoformat() if isinstance(signal.get('detected_at'), datetime) else str(signal.get('detected_at') or ''),
+                                            'error': persist_error
+                                        }
+                                    )
+                                    self._write_backtest_scan_csv(
+                                        'persist_signal_failed',
+                                        {
+                                            'symbol': signal.get('symbol'),
+                                            'instrument_symbol': signal.get('symbol'),
+                                            'option_type': signal.get('option_type'),
+                                            'strike': signal.get('strike_price'),
+                                            'candle_time': signal.get('detected_at').isoformat() if isinstance(signal.get('detected_at'), datetime) else str(signal.get('detected_at') or ''),
+                                            'price_multiplier': float(getattr(self.config, 'price_multiplier', 0) or 0),
+                                            'signal_detected': True,
+                                            'skip_reason': persist_error,
+                                            'note': 'signal_detected_but_persist_failed'
+                                        }
+                                    )
+                            except Exception as exc:
+                                logger.exception('Backtest signal post-processing failed for %s: %s', signal.get('symbol'), str(exc))
 
                             symbol_detected.append(signal)
 
@@ -1847,6 +1883,7 @@ class ScannerEngine:
         return fallback
 
     def _persist_signals(self, signals, mode):
+        self._last_signal_persist_error = None
         signal_records = []
         for signal in signals:
             detected_at = signal.get('detected_at')
@@ -1891,9 +1928,12 @@ class ScannerEngine:
                         )
                     )
             db.session.commit()
+            return len(signal_records)
         except Exception as e:
             db.session.rollback()
-            logger.error(f'Failed to persist signals: {str(e)}')
+            self._last_signal_persist_error = str(e)
+            logger.exception('Failed to persist signals: %s', str(e))
+            return 0
 
     def _serialize_realtime_signal(self, signal):
         """Convert signal values to JSON-safe payload for websocket emit."""
