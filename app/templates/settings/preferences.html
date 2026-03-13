@@ -135,6 +135,40 @@
                         </div>
                     </div>
 
+                    <div class="form-check form-switch mb-3">
+                        <input type="hidden" name="live_fast_mode_enabled" value="0">
+                        <input class="form-check-input" type="checkbox" id="live_fast_mode_enabled" name="live_fast_mode_enabled" value="1" {% if user.live_fast_mode_enabled is not sameas false %}checked{% endif %}>
+                        <label class="form-check-label" for="live_fast_mode_enabled">Fast Live Mode (Rotate Stocks, Cap Strikes)</label>
+                        <small class="text-muted d-block">Reduces cycle time by scanning a rotating subset of stocks and strikes each cycle.</small>
+                    </div>
+
+                    <div class="row">
+                        <div class="col-md-6 mb-3">
+                            <label for="live_fast_max_stocks" class="form-label">Fast Live Max Stocks Per Cycle</label>
+                            <input
+                                type="number"
+                                class="form-control"
+                                id="live_fast_max_stocks"
+                                name="live_fast_max_stocks"
+                                min="1"
+                                max="1000"
+                                value="{{ user.live_fast_max_stocks or 60 }}"
+                            >
+                        </div>
+                        <div class="col-md-6 mb-3">
+                            <label for="live_fast_max_strikes_per_stock" class="form-label">Fast Live Max Strikes Per Stock</label>
+                            <input
+                                type="number"
+                                class="form-control"
+                                id="live_fast_max_strikes_per_stock"
+                                name="live_fast_max_strikes_per_stock"
+                                min="2"
+                                max="500"
+                                value="{{ user.live_fast_max_strikes_per_stock or 24 }}"
+                            >
+                        </div>
+                    </div>
+
                     <div class="mb-3">
                         <label for="backtest_rebalance_frequency" class="form-label">Backtest Rebalance Frequency</label>
                         <select class="form-select" id="backtest_rebalance_frequency" name="backtest_rebalance_frequency">

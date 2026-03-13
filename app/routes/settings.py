@@ -546,6 +546,9 @@ def preferences():
         live_prefilter_top_movers = _clamp_int(request.form.get('live_prefilter_top_movers'), 0, 500, 30)
         live_prefilter_top_volume = _clamp_int(request.form.get('live_prefilter_top_volume'), 0, 500, 30)
         live_prefilter_max_stocks = _clamp_int(request.form.get('live_prefilter_max_stocks'), 1, 500, 50)
+        live_fast_mode_enabled = _form_bool(request.form, 'live_fast_mode_enabled', default=True)
+        live_fast_max_stocks = _clamp_int(request.form.get('live_fast_max_stocks'), 1, 1000, 60)
+        live_fast_max_strikes_per_stock = _clamp_int(request.form.get('live_fast_max_strikes_per_stock'), 2, 500, 24)
         backtest_rebalance_frequency = _normalized_rebalance_frequency(request.form.get('backtest_rebalance_frequency', 'weekly'))
         backtest_strict_first_candle = _form_bool(request.form, 'backtest_strict_first_candle', default=True)
         backtest_liquidity_filter_enabled = _form_bool(request.form, 'backtest_liquidity_filter_enabled', default=True)
@@ -565,6 +568,9 @@ def preferences():
         current_user.live_prefilter_top_movers = live_prefilter_top_movers
         current_user.live_prefilter_top_volume = live_prefilter_top_volume
         current_user.live_prefilter_max_stocks = live_prefilter_max_stocks
+        current_user.live_fast_mode_enabled = live_fast_mode_enabled
+        current_user.live_fast_max_stocks = live_fast_max_stocks
+        current_user.live_fast_max_strikes_per_stock = live_fast_max_strikes_per_stock
         current_user.backtest_rebalance_frequency = backtest_rebalance_frequency
         current_user.backtest_strict_first_candle = backtest_strict_first_candle
         current_user.backtest_liquidity_filter_enabled = backtest_liquidity_filter_enabled

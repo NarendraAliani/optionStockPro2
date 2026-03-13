@@ -117,6 +117,9 @@ def _user_runtime_defaults():
         'livePrefilterTopVolume': _clamp_int(getattr(current_user, 'live_prefilter_top_volume', 30), 0, 500, 30),
         'livePrefilterMaxStocks': _clamp_int(getattr(current_user, 'live_prefilter_max_stocks', 50), 1, 500, 50),
         'liveUseQueue': bool(getattr(current_user, 'live_use_queue', env_live_queue)),
+        'liveFastModeEnabled': bool(getattr(current_user, 'live_fast_mode_enabled', True)),
+        'liveFastMaxStocks': _clamp_int(getattr(current_user, 'live_fast_max_stocks', 60), 1, 1000, 60),
+        'liveFastMaxStrikesPerStock': _clamp_int(getattr(current_user, 'live_fast_max_strikes_per_stock', 24), 2, 500, 24),
         'liveWorkersCap': live_cap,
         'backtestWorkersCap': backtest_cap,
         'backtestRebalanceFrequency': _normalize_rebalance_frequency(

@@ -133,6 +133,7 @@
             <div class="mini-stat"><span>Scripts scanned:</span> <span id="liveScriptsScanned">0</span></div>
             <div class="mini-stat"><span>Strikes scanned:</span> <span id="liveStrikesScanned">0</span></div>
             <div class="mini-stat"><span>Skip Candles:</span> <span id="liveSkippedCandles">0</span></div>
+            <div class="mini-stat"><span>Skip Breakdown:</span> <span class="text-small" id="liveSkipBreakdown">--</span></div>
             <div class="mini-stat"><span>Workers:</span> <span id="liveWorkers">--</span></div>
             <div class="mini-stat"><span>Worker Status:</span> <span class="status-badge-gray" id="liveWorkerBadge">Unknown</span></div>
             <div class="mini-stat"><span>Generated:</span> <span id="liveSignalsGenerated">0</span></div>
@@ -401,6 +402,7 @@
     let titleFlashOn = false;
     let signalCardPulseTimer = null;
     let lastRealtimeSignalAt = 0;
+    let lastLiveStatus = null;
     const displayedAtCache = {};
     const ohlcBackfillRequested = { live: false, backtest: false };
     let ohlcBackfillInProgress = false;
@@ -566,6 +568,7 @@
                 $('#liveScriptsScanned').text(total > 0 ? (scanned + ' / ' + total) : String(scanned));
                 $('#liveStrikesScanned').text(strikesTotal > 0 ? (strikesScanned + ' / ' + strikesTotal) : String(strikesScanned));
                 $('#liveSkippedCandles').text(String(skippedCandles));
+                $('#liveSkipBreakdown').text(buildLiveSkipBreakdown(payload));
             });
         } catch (e) {
             // Keep polling path active if socket fails.
@@ -840,6 +843,9 @@
         config.guardrailEnabled = scannerConfig.guardrailEnabled !== false;
         config.guardrailLoadThreshold = Number(scannerConfig.guardrailLoadThreshold || 1200);
         config.scanProfile = scannerConfig.scanProfile || 'balanced';
+        config.liveFastModeEnabled = scannerConfig.liveFastModeEnabled !== false;
+        config.liveFastMaxStocks = Number(scannerConfig.liveFastMaxStocks || 60);
+        config.liveFastMaxStrikesPerStock = Number(scannerConfig.liveFastMaxStrikesPerStock || 24);
 
         const liveEstimate = estimateLoadUnits(config, 'live');
         if (config.guardrailEnabled && liveEstimate > Number(config.guardrailLoadThreshold || 1200)) {
@@ -1318,6 +1324,8 @@
             ', Profile: ' + String(scannerConfig.scanProfile || 'balanced') +
             ', Auto Tune: ' + (scannerConfig.autoTune === false ? 'Off' : 'On') +
             ', Live Pre-filter: ' + (scannerConfig.livePrefilterEnabled === false ? 'Off' : 'On') +
+            ', Fast Live: ' + (scannerConfig.liveFastModeEnabled === false ? 'Off' : 'On') +
+            ', Live Cap: ' + Number(scannerConfig.liveFastMaxStocks || 60) + ' stocks/' + Number(scannerConfig.liveFastMaxStrikesPerStock || 24) + ' strikes' +
             ', Rebalance: ' + String(scannerConfig.backtestRebalanceFrequency || 'weekly') +
             ', Strict Baseline: ' + (scannerConfig.backtestStrictFirstCandle === false ? 'Off' : 'On') +
             ', Liquidity Filter: ' + (scannerConfig.backtestLiquidityFilterEnabled === false ? 'Off' : 'On');
@@ -1351,6 +1359,13 @@
                     badge.addClass('status-badge-gray');
                 }
                 if (liveWorkerBadge.length) {
+                    if (lastLiveStatus && lastLiveStatus.live_use_queue === false) {
+                        liveWorkerBadge
+                            .text('Local')
+                            .removeClass('status-badge-gray status-badge-green status-badge-red')
+                            .addClass('status-badge-gray');
+                        return;
+                    }
                     let workerLabel = 'Unknown';
                     if (workerStatus === 'ok') {
                         workerLabel = 'Running';
@@ -1371,7 +1386,11 @@
                 badge.removeClass('status-badge-gray status-badge-green').addClass('status-badge-red');
                 const liveWorkerBadge = $('#liveWorkerBadge');
                 if (liveWorkerBadge.length) {
-                    liveWorkerBadge.text('Down').removeClass('status-badge-gray status-badge-green').addClass('status-badge-red');
+                    if (lastLiveStatus && lastLiveStatus.live_use_queue === false) {
+                        liveWorkerBadge.text('Local').removeClass('status-badge-green status-badge-red').addClass('status-badge-gray');
+                    } else {
+                        liveWorkerBadge.text('Down').removeClass('status-badge-gray status-badge-green').addClass('status-badge-red');
+                    }
                 }
             }
         });
@@ -1388,10 +1407,23 @@
     }
 
     function estimateLoadUnits(config, mode, startDate, endDate) {
-        const stocks = estimateStockUniverse(config || {});
+        let stocks = estimateStockUniverse(config || {});
         const strikeRaw = Number((config || {}).strikeRange ?? 0);
         const strikeRange = strikeRaw <= 0 ? 20 : Math.max(1, strikeRaw);
         const timeframe = Math.max(1, Number((config || {}).timeframe || 5));
+        if (mode === 'live' && config && config.liveFastModeEnabled !== false) {
+            const fastStocks = Number(config.liveFastMaxStocks || 60);
+            if (isFinite(fastStocks) && fastStocks > 0) {
+                stocks = Math.min(stocks, fastStocks);
+            }
+        }
+        let strikesPerStock = Math.max(2, strikeRange * 2);
+        if (mode === 'live' && config && config.liveFastModeEnabled !== false) {
+            const fastStrikes = Number(config.liveFastMaxStrikesPerStock || 24);
+            if (isFinite(fastStrikes) && fastStrikes > 0) {
+                strikesPerStock = Math.min(strikesPerStock, fastStrikes);
+            }
+        }
         let days = 1;
         if (mode === 'backtest' && startDate && endDate) {
             const s = new Date(startDate + 'T00:00:00');
@@ -1399,7 +1431,7 @@
             const diff = Math.floor((e.getTime() - s.getTime()) / (24 * 60 * 60 * 1000)) + 1;
             days = Math.max(1, isFinite(diff) ? diff : 7);
         }
-        let load = stocks * Math.max(2, strikeRange * 2);
+        let load = stocks * strikesPerStock;
         if (mode === 'backtest') load *= days;
         if (timeframe <= 3) load *= 1.35;
         if (timeframe >= 15) load *= 0.8;
@@ -1761,6 +1793,25 @@
         return String(Math.trunc(workers));
     }
 
+    function buildLiveSkipBreakdown(data) {
+        const parts = [];
+        const prefilter = Number(data.prefilter_skipped || 0);
+        const cmp = Number(data.cmp_skipped || 0);
+        const missingQuotes = Number(data.missing_quotes || 0);
+        const missingExpiry = Number(data.missing_expiry || 0);
+        const missingSpot = Number(data.missing_spot || 0);
+        const fastStock = Number(data.fast_stock_skipped || 0);
+        const fastStrikes = Number(data.fast_strike_skipped || 0);
+        if (prefilter > 0) parts.push('Prefilter: ' + prefilter);
+        if (cmp > 0) parts.push('CMP: ' + cmp);
+        if (missingQuotes > 0) parts.push('No Quote: ' + missingQuotes);
+        if (missingExpiry > 0) parts.push('No Expiry: ' + missingExpiry);
+        if (missingSpot > 0) parts.push('No Spot: ' + missingSpot);
+        if (fastStock > 0) parts.push('Fast Stock: ' + fastStock);
+        if (fastStrikes > 0) parts.push('Fast Strikes: ' + fastStrikes);
+        return parts.length ? parts.join(' | ') : '--';
+    }
+
     function formatAutoTuneSuffix(data) {
         if (!data || data.auto_tune !== true) return '';
         const summary = String(data.auto_tune_summary || ((data.auto_tune_details || {}).summary) || 'enabled').trim();
@@ -1782,6 +1833,7 @@
         }
 
         if (type === 'live') {
+            lastLiveStatus = data || null;
             if (liveStatusConfirmTimer) {
                 clearTimeout(liveStatusConfirmTimer);
                 liveStatusConfirmTimer = null;
@@ -1801,25 +1853,49 @@
             const skippedCandles = Number(data.skipped_candles || 0);
             const workers = formatWorkers(data.workers);
             const autoTuneSuffix = formatAutoTuneSuffix(data);
+            const fastStockSkipped = Number(data.fast_stock_skipped || 0);
+            const fastStrikeSkipped = Number(data.fast_strike_skipped || 0);
+            const fastSuffix = (fastStockSkipped > 0 || fastStrikeSkipped > 0)
+                ? (' Fast live mode rotating. Skipped stocks: ' + fastStockSkipped + ', strikes: ' + fastStrikeSkipped + '.')
+                : '';
+            const cycleStarted = parseUtcDate(data.cycle_started_at);
+            const lastRun = parseUtcDate(data.last_run_at);
+            const cycleInProgress = !!cycleStarted && (!lastRun || (lastRun.getTime && lastRun.getTime() < cycleStarted.getTime()));
             $('#liveScriptsScanned').text(total > 0 ? (scanned + ' / ' + total) : String(scanned));
             $('#liveStrikesScanned').text(strikesTotal > 0 ? (strikesScanned + ' / ' + strikesTotal) : String(strikesScanned));
             $('#liveSkippedCandles').text(String(skippedCandles));
             $('#liveWorkers').text(workers);
+            $('#liveSkipBreakdown').text(buildLiveSkipBreakdown(data));
             $('#liveSignalsGenerated').text(Number(data.last_signals || 0));
             if (running) {
-                if (data.last_run_at) {
+                if (cycleInProgress) {
+                    const stocksScanned = Number(data.last_stocks_scanned || 0);
+                    const strikesScannedDone = Number(data.last_strikes_scanned || 0);
+                    const stocksTotal = Number(data.scripts_total || 0);
+                    const strikesTotalPlanned = Number(data.strikes_total || 0);
+                    const scannedDisplay = stocksTotal > 0
+                        ? (stocksScanned + ' / ' + stocksTotal)
+                        : String(stocksScanned);
+                    const strikesDisplay = strikesTotalPlanned > 0
+                        ? (strikesScannedDone + ' / ' + strikesTotalPlanned)
+                        : String(strikesScannedDone);
+                    $('#liveProcessNote')
+                        .removeClass('text-muted text-success text-danger')
+                        .addClass('text-warning')
+                        .html('<span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>Cycle in progress... Stocks scanned: ' + scannedDisplay + '. Strikes scanned: ' + strikesDisplay + '. Workers: ' + workers + '.' + autoTuneSuffix + fastSuffix);
+                } else if (data.last_run_at) {
                     const stocksScanned = Number(data.last_stocks_scanned || 0);
                     const strikesScannedDone = Number(data.last_strikes_scanned || 0);
                     if ((data.last_signals || 0) > 0) {
                         $('#liveProcessNote')
                             .removeClass('text-muted text-warning text-success text-danger')
                             .addClass('text-success')
-                            .text('Scanner processed latest cycle and found ' + (data.last_signals || 0) + ' signal(s). Stocks scanned: ' + stocksScanned + '. Strikes scanned: ' + strikesScannedDone + '. Workers: ' + workers + '.' + autoTuneSuffix);
+                            .text('Scanner processed latest cycle and found ' + (data.last_signals || 0) + ' signal(s). Stocks scanned: ' + stocksScanned + '. Strikes scanned: ' + strikesScannedDone + '. Workers: ' + workers + '.' + autoTuneSuffix + fastSuffix);
                     } else {
                         $('#liveProcessNote')
                             .removeClass('text-muted text-warning text-success text-danger')
                             .addClass('text-warning')
-                            .text('Scanner is running. Latest cycle completed: no signal generated. Stocks scanned: ' + stocksScanned + '. Strikes scanned: ' + strikesScannedDone + '. Workers: ' + workers + '.' + autoTuneSuffix);
+                            .text('Scanner is running. Latest cycle completed: no signal generated. Stocks scanned: ' + stocksScanned + '. Strikes scanned: ' + strikesScannedDone + '. Workers: ' + workers + '.' + autoTuneSuffix + fastSuffix);
                     }
                 } else {
                     const stocksScanned = Number(data.last_stocks_scanned || 0);
@@ -1835,7 +1911,20 @@
                     $('#liveProcessNote')
                         .removeClass('text-muted text-warning text-success text-danger')
                         .addClass('text-warning')
-                        .html('<span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>Scanner is processing... Stocks scanned: ' + scannedDisplay + '. Strikes scanned: ' + strikesDisplay + '. Workers: ' + workers + '.' + autoTuneSuffix);
+                        .html('<span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>Scanner is processing... Stocks scanned: ' + scannedDisplay + '. Strikes scanned: ' + strikesDisplay + '. Workers: ' + workers + '.' + autoTuneSuffix + fastSuffix);
+                }
+                const strikesScannedDone = Number(data.last_strikes_scanned || 0);
+                if (skippedCandles > 0 && strikesScannedDone > 0 && skippedCandles >= strikesScannedDone) {
+                    let reasonNote = 'Candle data missing for all strikes. Check market hours, timezone, or SmartAPI historical data.';
+                    if (data.skip_reason === 'market_closed') {
+                        reasonNote = 'Market appears closed. Candle data is unavailable, so all strikes are skipped.';
+                    } else if (data.skip_reason === 'no_candles') {
+                        reasonNote = 'SmartAPI returned no recent candles. Check server timezone and data availability.';
+                    }
+                    $('#liveProcessNote')
+                        .removeClass('text-muted text-success text-danger')
+                        .addClass('text-warning')
+                        .text(reasonNote + ' Skipped candles: ' + skippedCandles + '.');
                 }
             } else {
                 const stocksScanned = Number(data.last_stocks_scanned || 0);

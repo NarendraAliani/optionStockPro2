@@ -324,6 +324,30 @@ def _resolve_live_prefilter_settings(user_id, config_data=None):
     }
 
 
+def _resolve_live_fast_settings(user_id, config_data=None):
+    cfg_data = config_data if isinstance(config_data, dict) else {}
+    user = User.query.get(user_id)
+    enabled_raw = cfg_data.get('liveFastModeEnabled')
+    enabled = _safe_bool(enabled_raw, default=bool(getattr(user, 'live_fast_mode_enabled', True))) if enabled_raw is not None else bool(getattr(user, 'live_fast_mode_enabled', True))
+    max_stocks = _clamp_int(
+        cfg_data.get('liveFastMaxStocks', getattr(user, 'live_fast_max_stocks', 60)),
+        1,
+        1000,
+        60
+    )
+    max_strikes = _clamp_int(
+        cfg_data.get('liveFastMaxStrikesPerStock', getattr(user, 'live_fast_max_strikes_per_stock', 24)),
+        2,
+        500,
+        24
+    )
+    return {
+        'enabled': bool(enabled),
+        'max_stocks': int(max_stocks),
+        'max_strikes_per_stock': int(max_strikes)
+    }
+
+
 def _resolve_backtest_runtime_settings(user_id, config_data=None):
     cfg_data = config_data if isinstance(config_data, dict) else {}
     user = User.query.get(user_id)
@@ -496,6 +520,7 @@ def start_live_scan(app, user_id, config_data):
         config = _build_scanner_config(user_id, config_data, mode='live')
         worker_count, tune_detail = _effective_worker_count(user_id, config_data, mode='live')
         prefilter = _resolve_live_prefilter_settings(user_id, config_data)
+        fast_mode = _resolve_live_fast_settings(user_id, config_data)
         live_use_queue = _safe_bool(
             (config_data or {}).get('liveUseQueue'),
             default=bool(getattr(user, 'live_use_queue', False))
@@ -510,10 +535,13 @@ def start_live_scan(app, user_id, config_data):
             live_prefilter_top_movers=prefilter['top_movers'],
             live_prefilter_top_volume=prefilter['top_volume'],
             live_prefilter_max_stocks=prefilter['max_stocks'],
+            live_fast_mode_enabled=fast_mode['enabled'],
+            live_fast_max_stocks=fast_mode['max_stocks'],
+            live_fast_max_strikes_per_stock=fast_mode['max_strikes_per_stock'],
             api_error_log_enabled=bool(getattr(user, 'api_error_log_enabled', False))
         )
         engine.is_running = True
-        selected_expiries = engine.get_selected_expiries(reference_date=datetime.now())
+        selected_expiries = engine.get_selected_expiries(reference_date=engine._market_now())
         scripts_total = int(len(selected_expiries or {}))
         engine.last_cycle_stocks_total = scripts_total
 
@@ -535,11 +563,24 @@ def start_live_scan(app, user_id, config_data):
                 'scripts_total': scripts_total,
                 'last_strikes_scanned': 0,
                 'strikes_total': 0,
+                'strikes_planned': 0,
                 'skipped_candles': 0,
+                'skip_reason': None,
+                'prefilter_skipped': 0,
+                'missing_quotes': 0,
+                'cmp_skipped': 0,
+                'missing_expiry': 0,
+                'missing_spot': 0,
+                'fast_stock_skipped': 0,
+                'fast_strike_skipped': 0,
                 'timeframe': config.timeframe,
                 'price_multiplier': float(config.price_multiplier),
                 'selected_expiries': selected_expiries,
                 'workers': worker_count,
+                'live_use_queue': bool(live_use_queue),
+                'live_fast_mode': bool(fast_mode['enabled']),
+                'live_fast_max_stocks': int(fast_mode['max_stocks']),
+                'live_fast_max_strikes_per_stock': int(fast_mode['max_strikes_per_stock']),
                 'live_prefilter_enabled': bool(prefilter['enabled']),
                 'live_prefilter_top_movers': int(prefilter['top_movers']),
                 'live_prefilter_top_volume': int(prefilter['top_volume']),
@@ -597,7 +638,7 @@ def _start_streaming_for_live(user_id, engine, angel_api):
         exchange_type = int(os.getenv('LIVE_STREAMING_EXCHANGE_TYPE', '2') or 2)
         tokens = []
         symbols = engine._resolve_stock_selection()
-        ref = datetime.now()
+        ref = engine._market_now()
         for symbol in symbols:
             expiry = engine._resolve_expiry(symbol, reference_date=ref)
             if not expiry:
@@ -929,7 +970,16 @@ def _update_live_status(
     stocks_total=None,
     strikes_scanned=None,
     strikes_total=None,
-    skipped_candles=None
+    skipped_candles=None,
+    skip_reason=None,
+    prefilter_skipped=None,
+    missing_quotes=None,
+    cmp_skipped=None,
+    missing_expiry=None,
+    missing_spot=None,
+    fast_stock_skipped=None,
+    fast_strike_skipped=None,
+    strikes_planned=None
 ):
     emit_progress = False
     progress_payload = None
@@ -959,6 +1009,24 @@ def _update_live_status(
             status['strikes_total'] = strikes_total
         if skipped_candles is not None:
             status['skipped_candles'] = skipped_candles
+        if skip_reason is not None:
+            status['skip_reason'] = skip_reason
+        if prefilter_skipped is not None:
+            status['prefilter_skipped'] = prefilter_skipped
+        if missing_quotes is not None:
+            status['missing_quotes'] = missing_quotes
+        if cmp_skipped is not None:
+            status['cmp_skipped'] = cmp_skipped
+        if missing_expiry is not None:
+            status['missing_expiry'] = missing_expiry
+        if missing_spot is not None:
+            status['missing_spot'] = missing_spot
+        if fast_stock_skipped is not None:
+            status['fast_stock_skipped'] = fast_stock_skipped
+        if fast_strike_skipped is not None:
+            status['fast_strike_skipped'] = fast_strike_skipped
+        if strikes_planned is not None:
+            status['strikes_planned'] = strikes_planned
         if error:
             status['last_error'] = error
         elif last_run_at or signals is not None:
@@ -1000,7 +1068,16 @@ def _update_live_status(
                 'stocks_total': _safe_int(status.get('scripts_total', 0)),
                 'strikes_scanned': _safe_int(status.get('last_strikes_scanned', 0)),
                 'strikes_total': _safe_int(status.get('strikes_total', 0)),
+                'strikes_planned': _safe_int(status.get('strikes_planned', 0)),
                 'skipped_candles': _safe_int(status.get('skipped_candles', 0)),
+                'prefilter_skipped': _safe_int(status.get('prefilter_skipped', 0)),
+                'missing_quotes': _safe_int(status.get('missing_quotes', 0)),
+                'cmp_skipped': _safe_int(status.get('cmp_skipped', 0)),
+                'missing_expiry': _safe_int(status.get('missing_expiry', 0)),
+                'missing_spot': _safe_int(status.get('missing_spot', 0)),
+                'fast_stock_skipped': _safe_int(status.get('fast_stock_skipped', 0)),
+                'fast_strike_skipped': _safe_int(status.get('fast_strike_skipped', 0)),
+                'skip_reason': status.get('skip_reason'),
                 'running': bool(status.get('running', False)),
                 'updated_at': datetime.utcnow().isoformat() + 'Z'
             }

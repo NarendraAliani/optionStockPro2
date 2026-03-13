@@ -1,9 +1,19 @@
 import logging
+import os
+import sys
 from logging.config import fileConfig
 
-from flask import current_app
+from flask import current_app, has_app_context
 
 from alembic import context
+
+if not has_app_context():
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+    from app import create_app
+    _app = create_app()
+    _app.app_context().push()
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.

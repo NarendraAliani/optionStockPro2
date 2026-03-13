@@ -6,7 +6,7 @@ try:
     import pyotp
 except Exception:
     pyotp = None
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 from collections import deque
 from threading import Lock
 import time
@@ -20,6 +20,10 @@ import socket
 import uuid
 import subprocess
 import platform
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +151,30 @@ class AngelOneAPI:
         self._client_local_ip = os.getenv('SMARTAPI_CLIENT_LOCAL_IP')
         self._client_mac = os.getenv('SMARTAPI_CLIENT_MAC')
         self._use_real_ips = os.getenv('SMARTAPI_USE_REAL_IPS', 'true').lower() == 'true'
+        self._market_tz_name = str(os.getenv('TIMEZONE', 'Asia/Kolkata') or 'Asia/Kolkata').strip()
+        self._market_tz = None
+        if ZoneInfo:
+            try:
+                self._market_tz = ZoneInfo(self._market_tz_name)
+            except Exception:
+                self._market_tz = None
+
+    def market_now(self):
+        tz = self._market_tz or timezone.utc
+        return datetime.now(tz)
+
+    def _ensure_market_time(self, dt):
+        if not dt:
+            return dt
+        tz = self._market_tz or timezone.utc
+        if isinstance(dt, datetime) and dt.tzinfo is None:
+            return dt.replace(tzinfo=tz)
+        if isinstance(dt, datetime):
+            try:
+                return dt.astimezone(tz)
+            except Exception:
+                return dt
+        return dt
     
     def authenticate(self):
         """
@@ -1069,6 +1097,8 @@ class AngelOneAPI:
                 symbol = instrument['symbol']
 
             interval = self._map_interval(timeframe)
+            from_date = self._ensure_market_time(from_date)
+            to_date = self._ensure_market_time(to_date)
             params = {
                 'exchange': exchange,
                 'symboltoken': token,
@@ -1172,7 +1202,7 @@ class AngelOneAPI:
             pass
 
         interval_minutes = self._interval_minutes(timeframe)
-        now = datetime.now()
+        now = self.market_now()
         latest_start, previous_start = self._live_candle_window(now, interval_minutes)
         cache_key = (str(instrument.get('token')), str(exchange or ''), int(interval_minutes), latest_start.isoformat())
         with self._candle_pair_lock:
@@ -1188,6 +1218,19 @@ class AngelOneAPI:
             exchange=exchange,
             symbol_token=instrument['token']
         )
+        if not candles or len(candles) < 2:
+            for multiplier in (2, 4):
+                fallback_from = latest_start - timedelta(minutes=interval_minutes * multiplier)
+                candles = self.get_historical_data(
+                    symbol=instrument['symbol'],
+                    timeframe=timeframe,
+                    from_date=fallback_from,
+                    to_date=latest_start,
+                    exchange=exchange,
+                    symbol_token=instrument['token']
+                )
+                if candles and len(candles) >= 2:
+                    break
 
         if not candles or len(candles) < 2:
             return None
@@ -1229,7 +1272,7 @@ class AngelOneAPI:
     def get_previous_close(self, symbol, exchange, symbol_token, timeframe):
         """Fetch previous candle close for the given symbol."""
         interval_minutes = self._interval_minutes(timeframe)
-        to_date = datetime.now()
+        to_date = self.market_now()
         from_date = to_date - timedelta(minutes=interval_minutes * 3)
         candles = self.get_historical_data(
             symbol=symbol,
@@ -1275,6 +1318,7 @@ class AngelOneAPI:
         return 5
 
     def _live_candle_window(self, now, interval_minutes):
+        now = self._ensure_market_time(now)
         interval = max(1, int(interval_minutes))
         bucket_minute = (now.minute // interval) * interval
         latest_start = now.replace(minute=bucket_minute, second=0, microsecond=0)

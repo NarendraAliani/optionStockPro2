@@ -9,7 +9,7 @@ from app.services.live_scan_jobs import scan_live_symbol_job
 from app.models.signal import Signal
 from app.models.signal_detail import SignalDetail
 from app import db, socketio
-from datetime import datetime, date, timezone, timedelta
+from datetime import datetime, date, timezone, timedelta, time as dt_time
 from collections import OrderedDict
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -49,6 +49,9 @@ class ScannerEngine:
         live_prefilter_top_volume=None,
         live_prefilter_max_stocks=None,
         live_use_queue=None,
+        live_fast_mode_enabled=None,
+        live_fast_max_stocks=None,
+        live_fast_max_strikes_per_stock=None,
         backtest_rebalance_frequency='weekly',
         backtest_strict_first_candle=True,
         backtest_liquidity_filter_enabled=True,
@@ -104,6 +107,17 @@ class ScannerEngine:
             50
         )
         self._live_use_queue = live_use_queue
+        env_fast_mode = str(os.getenv('LIVE_FAST_MODE_ENABLED', 'true')).strip().lower() in ('1', 'true', 'yes', 'on')
+        self._live_fast_enabled = env_fast_mode if live_fast_mode_enabled is None else bool(live_fast_mode_enabled)
+        self._live_fast_max_stocks = self._safe_int(
+            live_fast_max_stocks if live_fast_max_stocks is not None else os.getenv('LIVE_FAST_MAX_STOCKS', '60'),
+            60
+        )
+        self._live_fast_max_strikes_per_stock = self._safe_int(
+            live_fast_max_strikes_per_stock if live_fast_max_strikes_per_stock is not None else os.getenv('LIVE_FAST_MAX_STRIKES_PER_STOCK', '24'),
+            24
+        )
+        self._live_fast_cursor = 0
         self._candle_close_delay_seconds = self._safe_int(os.getenv('LIVE_CANDLE_CLOSE_DELAY_SECONDS', '8'), 8)
         self.max_workers = max(1, min(16, self._safe_int(workers, 8)))
         self._stop_event = Event()
@@ -132,6 +146,15 @@ class ScannerEngine:
         self._last_api_stats_log_at = 0.0
         self._queue_missing_since = None
         self._queue_force_disabled = False
+        self.last_cycle_skip_reason = None
+        self.last_cycle_prefilter_skipped = 0
+        self.last_cycle_missing_quotes = 0
+        self.last_cycle_cmp_skipped = 0
+        self.last_cycle_missing_expiry = 0
+        self.last_cycle_missing_spot = 0
+        self.last_cycle_fast_stock_skipped = 0
+        self.last_cycle_fast_strike_skipped = 0
+        self.last_cycle_strikes_planned = 0
     
     def start_live_scan(self):
         """Start live scanning"""
@@ -179,7 +202,16 @@ class ScannerEngine:
                         stocks_total=self.last_cycle_stocks_total,
                         strikes_scanned=self.last_cycle_strikes_scanned,
                         strikes_total=self.last_cycle_strikes_total,
-                        skipped_candles=self.last_cycle_skipped_candles
+                        skipped_candles=self.last_cycle_skipped_candles,
+                        skip_reason=self.last_cycle_skip_reason,
+                        prefilter_skipped=self.last_cycle_prefilter_skipped,
+                        missing_quotes=self.last_cycle_missing_quotes,
+                        cmp_skipped=self.last_cycle_cmp_skipped,
+                        missing_expiry=self.last_cycle_missing_expiry,
+                        missing_spot=self.last_cycle_missing_spot,
+                        fast_stock_skipped=self.last_cycle_fast_stock_skipped,
+                        fast_strike_skipped=self.last_cycle_fast_strike_skipped,
+                        strikes_planned=self.last_cycle_strikes_planned
                     )
                 self._log_api_activity('live')
             except Exception as e:
@@ -196,16 +228,25 @@ class ScannerEngine:
 
     def scan_once(self, progress_callback=None, reference_time=None, emit_signals=False):
         """Run a single live scan cycle and persist detected signals."""
-        cycle_time = reference_time or datetime.now()
+        cycle_time = reference_time or self._market_now()
         self._refresh_daily_caches(cycle_time)
         stocks_all = self._resolve_stock_selection()
         quotes = self._get_live_quotes(stocks_all)
-        stocks = self._prefilter_live_stocks(stocks_all, quotes)
+        stocks, prefilter_stats = self._prefilter_live_stocks(stocks_all, quotes)
         self.last_cycle_stocks_total = len(stocks)
         self.last_cycle_stocks_scanned = 0
         self.last_cycle_strikes_total = 0
+        self.last_cycle_strikes_planned = 0
         self.last_cycle_strikes_scanned = 0
         self.last_cycle_skipped_candles = 0
+        self.last_cycle_skip_reason = None
+        self.last_cycle_prefilter_skipped = self._safe_int(prefilter_stats.get('prefilter_skipped', 0), 0)
+        self.last_cycle_missing_quotes = self._safe_int(prefilter_stats.get('missing_quotes', 0), 0)
+        self.last_cycle_cmp_skipped = self._safe_int(prefilter_stats.get('cmp_skipped', 0), 0)
+        self.last_cycle_missing_expiry = 0
+        self.last_cycle_missing_spot = 0
+        self.last_cycle_fast_stock_skipped = 0
+        self.last_cycle_fast_strike_skipped = 0
         cmp_skipped = 0
         if progress_callback:
             progress_callback(
@@ -214,13 +255,34 @@ class ScannerEngine:
                 stocks_total=self.last_cycle_stocks_total,
                 strikes_scanned=0,
                 strikes_total=0,
-                skipped_candles=0
+                skipped_candles=0,
+                prefilter_skipped=self.last_cycle_prefilter_skipped,
+                missing_quotes=self.last_cycle_missing_quotes,
+                cmp_skipped=self.last_cycle_cmp_skipped,
+                missing_expiry=self.last_cycle_missing_expiry,
+                missing_spot=self.last_cycle_missing_spot,
+                fast_stock_skipped=self.last_cycle_fast_stock_skipped,
+                fast_strike_skipped=self.last_cycle_fast_strike_skipped,
+                strikes_planned=self.last_cycle_strikes_planned
             )
         timeframe = self._normalize_timeframe()
+        if self._live_fast_enabled and self._live_fast_max_stocks > 0 and len(stocks) > self._live_fast_max_stocks:
+            total = len(stocks)
+            start = self._live_fast_cursor % total
+            end = start + self._live_fast_max_stocks
+            if end <= total:
+                selected = stocks[start:end]
+            else:
+                selected = stocks[start:] + stocks[:end - total]
+            self._live_fast_cursor = (start + self._live_fast_max_stocks) % total
+            self.last_cycle_fast_stock_skipped = max(0, total - len(selected))
+            stocks = selected
+            self.last_cycle_stocks_total = len(stocks)
         symbol_jobs = []
         for symbol in stocks:
             expiry = self._resolve_expiry(symbol, reference_date=cycle_time)
             if not expiry:
+                self.last_cycle_missing_expiry += 1
                 symbol_jobs.append({'symbol': symbol, 'expiry': None, 'strikes_by_type': {'CE': [], 'PE': []}})
                 continue
 
@@ -228,6 +290,7 @@ class ScannerEngine:
             if not spot:
                 spot = self.angel_api.get_live_quote(symbol, exchange='NSE')
             if not spot or spot.get('ltp') is None:
+                self.last_cycle_missing_spot += 1
                 symbol_jobs.append({'symbol': symbol, 'expiry': expiry, 'strikes_by_type': {'CE': [], 'PE': []}})
                 continue
             spot_ltp = float(spot.get('ltp') or 0)
@@ -237,6 +300,9 @@ class ScannerEngine:
 
             strikes_by_type = self._resolve_strikes_by_type(symbol, expiry, spot_ltp)
             strikes_by_type = self._apply_live_strike_exclusions(symbol, spot_ltp, strikes_by_type)
+            strikes_by_type, skipped_fast = self._limit_live_strikes_by_fast_mode(strikes_by_type)
+            if skipped_fast:
+                self.last_cycle_fast_strike_skipped += skipped_fast
             symbol_jobs.append({
                 'symbol': symbol,
                 'expiry': expiry,
@@ -248,6 +314,7 @@ class ScannerEngine:
             len(job['strikes_by_type'].get('CE', [])) + len(job['strikes_by_type'].get('PE', []))
             for job in symbol_jobs
         )
+        self.last_cycle_strikes_planned = self.last_cycle_strikes_total + self.last_cycle_fast_strike_skipped
         if progress_callback:
             progress_callback(
                 self.user_id,
@@ -255,7 +322,15 @@ class ScannerEngine:
                 stocks_total=self.last_cycle_stocks_total,
                 strikes_scanned=self.last_cycle_strikes_scanned,
                 strikes_total=self.last_cycle_strikes_total,
-                skipped_candles=self.last_cycle_skipped_candles
+                skipped_candles=self.last_cycle_skipped_candles,
+                prefilter_skipped=self.last_cycle_prefilter_skipped,
+                missing_quotes=self.last_cycle_missing_quotes,
+                cmp_skipped=self.last_cycle_cmp_skipped,
+                missing_expiry=self.last_cycle_missing_expiry,
+                missing_spot=self.last_cycle_missing_spot,
+                fast_stock_skipped=self.last_cycle_fast_stock_skipped,
+                fast_strike_skipped=self.last_cycle_fast_strike_skipped,
+                strikes_planned=self.last_cycle_strikes_planned
             )
         if cmp_skipped and not self._prefilter_enabled:
             logger.info(
@@ -264,6 +339,7 @@ class ScannerEngine:
                 int(self._cmp_min),
                 int(self._cmp_max)
             )
+        self.last_cycle_cmp_skipped += self._safe_int(cmp_skipped, 0)
 
         detected = []
         if not symbol_jobs:
@@ -368,7 +444,15 @@ class ScannerEngine:
                             stocks_total=self.last_cycle_stocks_total,
                             strikes_scanned=self.last_cycle_strikes_scanned,
                             strikes_total=self.last_cycle_strikes_total,
-                            skipped_candles=self.last_cycle_skipped_candles
+                            skipped_candles=self.last_cycle_skipped_candles,
+                            prefilter_skipped=self.last_cycle_prefilter_skipped,
+                            missing_quotes=self.last_cycle_missing_quotes,
+                            cmp_skipped=self.last_cycle_cmp_skipped,
+                            missing_expiry=self.last_cycle_missing_expiry,
+                            missing_spot=self.last_cycle_missing_spot,
+                            fast_stock_skipped=self.last_cycle_fast_stock_skipped,
+                            fast_strike_skipped=self.last_cycle_fast_strike_skipped,
+                            strikes_planned=self.last_cycle_strikes_planned
                         )
                 if not self.is_running or self._stop_event.is_set():
                     aborted = True
@@ -419,7 +503,15 @@ class ScannerEngine:
                             stocks_total=self.last_cycle_stocks_total,
                             strikes_scanned=self.last_cycle_strikes_scanned,
                             strikes_total=self.last_cycle_strikes_total,
-                            skipped_candles=self.last_cycle_skipped_candles
+                            skipped_candles=self.last_cycle_skipped_candles,
+                            prefilter_skipped=self.last_cycle_prefilter_skipped,
+                            missing_quotes=self.last_cycle_missing_quotes,
+                            cmp_skipped=self.last_cycle_cmp_skipped,
+                            missing_expiry=self.last_cycle_missing_expiry,
+                            missing_spot=self.last_cycle_missing_spot,
+                            fast_stock_skipped=self.last_cycle_fast_stock_skipped,
+                            fast_strike_skipped=self.last_cycle_fast_strike_skipped,
+                            strikes_planned=self.last_cycle_strikes_planned
                         )
                     if not self.is_running or self._stop_event.is_set():
                         aborted = True
@@ -429,6 +521,12 @@ class ScannerEngine:
 
         if detected:
             self._persist_signals(detected, mode='live')
+
+        if self.last_cycle_strikes_scanned > 0 and self.last_cycle_skipped_candles > 0:
+            if self.last_cycle_skipped_candles >= self.last_cycle_strikes_scanned:
+                self.last_cycle_skip_reason = 'market_closed' if not self._market_is_open(cycle_time) else 'no_candles'
+            else:
+                self.last_cycle_skip_reason = 'partial_missing'
 
         return detected
 
@@ -1145,7 +1243,7 @@ class ScannerEngine:
             if not instrument:
                 return None
             interval_minutes = max(1, self._safe_int(timeframe, 5))
-            now = datetime.now()
+            now = self._market_now()
             latest_start, previous_start = self.angel_api._live_candle_window(now, interval_minutes)
             candles = self.angel_api.get_historical_data(
                 symbol=instrument['symbol'],
@@ -1155,6 +1253,19 @@ class ScannerEngine:
                 exchange='NFO',
                 symbol_token=instrument['token']
             ) or []
+            if len(candles) < 2:
+                for multiplier in (2, 4):
+                    fallback_from = latest_start - timedelta(minutes=interval_minutes * multiplier)
+                    candles = self.angel_api.get_historical_data(
+                        symbol=instrument['symbol'],
+                        timeframe=timeframe,
+                        from_date=fallback_from,
+                        to_date=latest_start,
+                        exchange='NFO',
+                        symbol_token=instrument['token']
+                    ) or []
+                    if len(candles) >= 2:
+                        break
             if len(candles) < 2:
                 return None
             prev = candles[-2]
@@ -1382,7 +1493,7 @@ class ScannerEngine:
         """Return selected expiry per symbol for current config."""
         selected = {}
         stocks = self._resolve_stock_selection()
-        ref = reference_date or datetime.now()
+        ref = reference_date or self._market_now()
         for symbol in stocks:
             expiry = self._resolve_expiry(symbol, reference_date=ref)
             selected[symbol] = expiry.isoformat() if expiry else None
@@ -1906,15 +2017,17 @@ class ScannerEngine:
 
     def _prefilter_live_stocks(self, stocks, quotes):
         if not stocks:
-            return []
+            return [], {'missing_quotes': 0, 'cmp_skipped': 0, 'prefilter_skipped': 0}
         if not self._prefilter_enabled:
-            return list(stocks)
+            return list(stocks), {'missing_quotes': 0, 'cmp_skipped': 0, 'prefilter_skipped': 0}
 
         ranked = []
+        missing_quotes = 0
         skipped_by_cmp = 0
         for symbol in stocks:
             quote = quotes.get(symbol)
             if not quote:
+                missing_quotes += 1
                 continue
             ltp = float(quote.get('ltp') or 0)
             if ltp < self._cmp_min or ltp > self._cmp_max:
@@ -1930,7 +2043,11 @@ class ScannerEngine:
             })
 
         if not ranked:
-            return list(stocks)
+            return list(stocks), {
+                'missing_quotes': missing_quotes,
+                'cmp_skipped': skipped_by_cmp,
+                'prefilter_skipped': max(0, len(stocks) - len(stocks))
+            }
 
         max_stocks = self._safe_int(self._prefilter_max_stocks, 50)
         top_movers = self._safe_int(self._prefilter_top_movers, 30)
@@ -1978,7 +2095,37 @@ class ScannerEngine:
                 int(self._cmp_min),
                 int(self._cmp_max)
             )
-        return selected
+        return selected, {
+            'missing_quotes': missing_quotes,
+            'cmp_skipped': skipped_by_cmp,
+            'prefilter_skipped': max(0, len(stocks) - len(selected))
+        }
+
+    def _limit_live_strikes_by_fast_mode(self, strikes_by_type):
+        if not self._live_fast_enabled:
+            return strikes_by_type, 0
+        cap = self._safe_int(self._live_fast_max_strikes_per_stock, 0)
+        if cap <= 0:
+            return strikes_by_type, 0
+        ce = list((strikes_by_type or {}).get('CE', []) or [])
+        pe = list((strikes_by_type or {}).get('PE', []) or [])
+        total = len(ce) + len(pe)
+        if total <= cap:
+            return strikes_by_type, 0
+        ce_cap = max(0, cap // 2)
+        pe_cap = max(0, cap - ce_cap)
+        if len(ce) < ce_cap:
+            pe_cap = min(len(pe), cap - len(ce))
+            ce_cap = len(ce)
+        elif len(pe) < pe_cap:
+            ce_cap = min(len(ce), cap - len(pe))
+            pe_cap = len(pe)
+        trimmed = {
+            'CE': ce[:ce_cap],
+            'PE': pe[:pe_cap]
+        }
+        skipped = max(0, total - (len(trimmed['CE']) + len(trimmed['PE'])))
+        return trimmed, skipped
 
     def _log_api_activity(self, mode):
         now = time.time()
@@ -1996,8 +2143,29 @@ class ScannerEngine:
         except Exception:
             pass
 
+    def _market_now(self):
+        try:
+            return self.angel_api.market_now()
+        except Exception:
+            return datetime.now()
+
+    def _market_is_open(self, dt=None):
+        try:
+            value = dt or self._market_now()
+            if isinstance(value, datetime) and value.tzinfo is not None:
+                local = value
+            else:
+                local = value
+            if local.weekday() >= 5:
+                return False
+            open_time = dt_time(9, 15)
+            close_time = dt_time(15, 30)
+            return open_time <= local.time() <= close_time
+        except Exception:
+            return True
+
     def _claim_live_candle_slot(self, timeframe_minutes):
-        now = datetime.now()
+        now = self._market_now()
         interval = max(1, self._safe_int(timeframe_minutes, 5))
         bucket_minute = (now.minute // interval) * interval
         current_bucket = now.replace(minute=bucket_minute, second=0, microsecond=0)
