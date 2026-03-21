@@ -18,6 +18,8 @@ class ScannerConfig(db.Model):
     strike_range = db.Column(db.Integer, default=0)
     # Live mode: exclude ATM and the next N strikes on each side.
     live_exclude_atm_strikes = db.Column(db.Integer, default=0)
+    # Live mode comparison rule: closed = current closed candle, cmp = live CMP vs previous closed candle.
+    live_candle_logic = db.Column(db.String(20), nullable=False, default='closed')
     # Minimum volume required for a signal.
     min_signal_volume = db.Column(db.Integer, default=10)
     price_multiplier = db.Column(db.Numeric(5, 2), default=2.00)

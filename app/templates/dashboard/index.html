@@ -372,7 +372,8 @@
         refreshInterval: 5,
         workers: 8,
         autoTune: true,
-        livePrefilterEnabled: true
+        livePrefilterEnabled: true,
+        liveCandleLogic: 'closed'
     };
     let latestSignalCounts = { live: 0, backtest: 0, total: 0 };
     let activeConfigIds = { live: null, backtest: null };
@@ -533,9 +534,7 @@
             socketClient.on('new_signal', function(signal) {
                 const payload = signal || {};
                 const mode = String(payload.mode || 'live').toLowerCase() === 'backtest' ? 'backtest' : 'live';
-                if (mode === 'live' && !liveScannerRunning) return;
-                if (mode === 'backtest' && !backtestRunning && !backtestStartPending) return;
-
+                // Accept socket-delivered signals immediately; polling remains only as a safety net.
                 lastRealtimeSignalAt = Date.now();
                 const appended = addSignalRowRealtime(mode, payload);
                 if (!appended) return;
@@ -1324,6 +1323,10 @@
         } else {
             stockLabel = stockLabels[scannerConfig.stockSelection] || scannerConfig.stockSelection;
         }
+        const liveLogicLabels = {
+            closed: 'Closed Candle Comparison Logic',
+            cmp: 'Live Candle Comparison Logic'
+        };
         const text = 'Stock: ' + stockLabel +
             ', Timeframe: ' + scannerConfig.timeframe + 'm' +
             ', Strike Range: ' + (Number(scannerConfig.strikeRange || 0) <= 0 ? 'All' : scannerConfig.strikeRange) +
@@ -1332,6 +1335,7 @@
             ', Workers Cap: ' + Number(scannerConfig.workers || 8) +
             ', Profile: ' + String(scannerConfig.scanProfile || 'balanced') +
             ', Auto Tune: ' + (scannerConfig.autoTune === false ? 'Off' : 'On') +
+            ', Live Candle Logic: ' + (liveLogicLabels[String(scannerConfig.liveCandleLogic || 'closed')] || String(scannerConfig.liveCandleLogic || 'closed')) +
             ', Live Pre-filter: ' + (scannerConfig.livePrefilterEnabled === false ? 'Off' : 'On') +
             ', Fast Live: ' + (scannerConfig.liveFastModeEnabled === false ? 'Off' : 'On') +
             ', Live Cap: ' + Number(scannerConfig.liveFastMaxStocks || 60) + ' stocks/' + Number(scannerConfig.liveFastMaxStrikesPerStock || 24) + ' strikes' +

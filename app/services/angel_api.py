@@ -1286,6 +1286,7 @@ class AngelOneAPI:
             'volume': volume,
             'open_interest': 0,
             'rsi': None,
+            'previous_candle_time': prev_ts,
             'candle_time': ts
         }
         with self._candle_pair_lock:

@@ -97,6 +97,9 @@ def scan_live_symbol_job(payload: Dict[str, Any]) -> Tuple[list, int, int, list]
         timeframe = int(payload.get('timeframe') or 5)
         price_multiplier = float(payload.get('price_multiplier') or 2.0)
         spot_price = payload.get('spot_price')
+        live_candle_logic = str(payload.get('live_candle_logic') or 'closed').strip().lower()
+        if live_candle_logic not in ('closed', 'cmp'):
+            live_candle_logic = 'closed'
 
         config = _DummyConfig(price_multiplier=price_multiplier, timeframe=timeframe)
         strikes_processed = 0
@@ -109,14 +112,55 @@ def scan_live_symbol_job(payload: Dict[str, Any]) -> Tuple[list, int, int, list]
                 if is_live_stop_requested(user_id):
                     return detected, strikes_processed, skipped, cycle_rows
                 strikes_processed += 1
-                option_snapshot = angel_api.get_recent_option_candle_pair(
-                    underlying=symbol,
-                    expiry=expiry,
-                    strike=strike,
-                    option_type=option_type,
-                    timeframe=timeframe,
-                    exchange='NFO'
-                )
+                if live_candle_logic == 'cmp':
+                    closed_snapshot = angel_api.get_recent_option_candle_pair(
+                        underlying=symbol,
+                        expiry=expiry,
+                        strike=strike,
+                        option_type=option_type,
+                        timeframe=timeframe,
+                        exchange='NFO'
+                    )
+                    live_snapshot = angel_api.get_option_snapshot(
+                        underlying=symbol,
+                        expiry=expiry,
+                        strike=strike,
+                        option_type=option_type,
+                        timeframe=timeframe,
+                        exchange='NFO'
+                    )
+                    option_snapshot = None
+                    if (
+                        closed_snapshot
+                        and live_snapshot
+                        and live_snapshot.get('ltp') is not None
+                        and closed_snapshot.get('previous_candle_close') is not None
+                    ):
+                        option_snapshot = {
+                            'symbol': live_snapshot.get('symbol') or closed_snapshot.get('symbol') or symbol,
+                            'option_type': option_type,
+                            'strike_price': strike,
+                            'previous_candle_close': float(closed_snapshot.get('previous_candle_close')),
+                            'previous_candle_time': closed_snapshot.get('previous_candle_time'),
+                            'current_candle_open': closed_snapshot.get('current_candle_open'),
+                            'current_candle_high': closed_snapshot.get('current_candle_high'),
+                            'current_candle_low': closed_snapshot.get('current_candle_low'),
+                            'current_candle_close': float(live_snapshot.get('ltp')),
+                            'volume': live_snapshot.get('volume', 0),
+                            'open_interest': live_snapshot.get('open_interest', 0),
+                            'rsi': None,
+                            'candle_time': closed_snapshot.get('candle_time'),
+                            'signal_time': datetime.utcnow()
+                        }
+                else:
+                    option_snapshot = angel_api.get_recent_option_candle_pair(
+                        underlying=symbol,
+                        expiry=expiry,
+                        strike=strike,
+                        option_type=option_type,
+                        timeframe=timeframe,
+                        exchange='NFO'
+                    )
                 if not option_snapshot:
                     skipped += 1
                     cycle_rows.append(_build_live_cycle_log_row(symbol, strike, option_type, None))
@@ -141,7 +185,9 @@ def scan_live_symbol_job(payload: Dict[str, Any]) -> Tuple[list, int, int, list]
                 if not signal:
                     continue
                 signal['expiry_date'] = expiry
-                signal['detected_at'] = option_snapshot.get('candle_time') or datetime.utcnow()
+                signal['live_candle_logic'] = live_candle_logic
+                signal['previous_candle_time'] = option_snapshot.get('previous_candle_time')
+                signal['detected_at'] = option_snapshot.get('signal_time') or option_snapshot.get('candle_time') or datetime.utcnow()
                 signal['displayed_at'] = datetime.utcnow()
                 if spot_price is not None:
                     signal['spot_price'] = float(spot_price)

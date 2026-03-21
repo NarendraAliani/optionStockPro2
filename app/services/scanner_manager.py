@@ -84,6 +84,11 @@ def _clamp_int(value, minimum, maximum, default):
     return max(minimum, min(maximum, num))
 
 
+def _normalize_live_candle_logic(value, default='closed'):
+    token = str(value or default).strip().lower()
+    return token if token in ('closed', 'cmp') else default
+
+
 def _estimate_symbol_count(stock_selection, mode='live'):
     if isinstance(stock_selection, list):
         return max(1, len([s for s in stock_selection if str(s).strip()]))
@@ -207,6 +212,7 @@ def _get_user_default_config_payload(user_id):
         'stockSelection': cfg.get_stock_selection() or 'all',
         'strikeRange': int(cfg.strike_range) if cfg.strike_range is not None else 0,
         'liveExcludeAtmStrikes': int(cfg.live_exclude_atm_strikes or 0),
+        'liveCandleLogic': _normalize_live_candle_logic(getattr(cfg, 'live_candle_logic', 'closed')),
         'minSignalVolume': int(cfg.min_signal_volume or 10),
         'priceMultiplier': float(cfg.price_multiplier or 2.0),
         'timeframe': int(timeframe_text.replace('min', '') or 5),
@@ -228,6 +234,9 @@ def _build_scanner_config(user_id, config_data, mode):
     default_strike_range = 0
     strike_range = int(_pick_config_value(config_data, user_defaults, 'strikeRange', default_strike_range))
     exclude_atm = _safe_int(_pick_config_value(config_data, user_defaults, 'liveExcludeAtmStrikes', 0), 0)
+    live_candle_logic = _normalize_live_candle_logic(
+        _pick_config_value(config_data, user_defaults, 'liveCandleLogic', 'closed')
+    )
     min_signal_volume = _clamp_int(
         _pick_config_value(config_data, user_defaults, 'minSignalVolume', 10),
         0,
@@ -249,6 +258,7 @@ def _build_scanner_config(user_id, config_data, mode):
         stock_selection=stock_selection,
         strike_range=strike_range,
         live_exclude_atm_strikes=max(0, min(10, exclude_atm)),
+        live_candle_logic=live_candle_logic,
         min_signal_volume=min_signal_volume,
         price_multiplier=price_multiplier,
         timeframe=f'{timeframe}min',

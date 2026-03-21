@@ -119,6 +119,7 @@ class ScannerEngine:
             24
         )
         self._live_fast_cursor = 0
+        self._live_candle_logic = self._normalize_live_candle_logic(getattr(self.config, 'live_candle_logic', 'closed'))
         self._candle_close_delay_seconds = self._safe_int(os.getenv('LIVE_CANDLE_CLOSE_DELAY_SECONDS', '8'), 8)
         self.max_workers = max(1, min(16, self._safe_int(workers, 8)))
         self._flask_app = current_app._get_current_object() if has_app_context() else None
@@ -409,7 +410,8 @@ class ScannerEngine:
                     'strikes_by_type': job['strikes_by_type'],
                     'timeframe': timeframe,
                     'price_multiplier': float(self.config.price_multiplier or 0),
-                    'spot_price': job.get('spot_price')
+                    'spot_price': job.get('spot_price'),
+                    'live_candle_logic': self._normalize_live_candle_logic(getattr(self.config, 'live_candle_logic', self._live_candle_logic))
                 }
                 jobs.append(queue.enqueue(scan_live_symbol_job, payload))
 
@@ -728,22 +730,13 @@ class ScannerEngine:
                 if not self.is_running or self._stop_event.is_set():
                     return symbol_detected, strikes_processed, skipped_candles, cycle_rows
                 strikes_processed += 1
-                option_snapshot = self.angel_api.get_recent_option_candle_pair(
-                    underlying=symbol,
+                option_snapshot = self._get_live_option_snapshot_for_logic(
+                    symbol=symbol,
                     expiry=expiry,
                     strike=strike,
                     option_type=option_type,
-                    timeframe=timeframe,
-                    exchange='NFO'
+                    timeframe=timeframe
                 )
-                if not option_snapshot:
-                    option_snapshot = self._get_live_option_snapshot_force_check(
-                        symbol=symbol,
-                        expiry=expiry,
-                        strike=strike,
-                        option_type=option_type,
-                        timeframe=timeframe
-                    )
                 if not option_snapshot:
                     skipped_candles += 1
                     self._write_api_error_log(
@@ -796,10 +789,14 @@ class ScannerEngine:
                 candle_time = option_snapshot.get('candle_time')
                 if not self._is_new_live_candle_signal(signal['symbol'], candle_time):
                     continue
+                signal['live_candle_logic'] = self._normalize_live_candle_logic(
+                    getattr(self.config, 'live_candle_logic', self._live_candle_logic)
+                )
+                signal['previous_candle_time'] = option_snapshot.get('previous_candle_time')
                 signal['expiry_date'] = expiry
                 if spot_price is not None:
                     signal['spot_price'] = float(spot_price)
-                signal['detected_at'] = candle_time or datetime.utcnow()
+                signal['detected_at'] = option_snapshot.get('signal_time') or candle_time or datetime.utcnow()
                 signal['displayed_at'] = datetime.utcnow()
                 symbol_detected.append(signal)
         return symbol_detected, strikes_processed, skipped_candles, cycle_rows
@@ -1461,6 +1458,63 @@ class ScannerEngine:
             }
         except Exception:
             return None
+
+    def _get_live_option_snapshot_for_logic(self, symbol, expiry, strike, option_type, timeframe):
+        """Return the live snapshot according to the selected live candle comparison logic."""
+        logic = self._normalize_live_candle_logic(getattr(self.config, 'live_candle_logic', self._live_candle_logic))
+        if logic == 'cmp':
+            closed_snapshot = self.angel_api.get_recent_option_candle_pair(
+                underlying=symbol,
+                expiry=expiry,
+                strike=strike,
+                option_type=option_type,
+                timeframe=timeframe,
+                exchange='NFO'
+            )
+            live_snapshot = self.angel_api.get_option_snapshot(
+                underlying=symbol,
+                expiry=expiry,
+                strike=strike,
+                option_type=option_type,
+                timeframe=timeframe,
+                exchange='NFO'
+            )
+            if not closed_snapshot or not live_snapshot:
+                return None
+            current_close = live_snapshot.get('ltp')
+            previous_close = closed_snapshot.get('previous_candle_close')
+            if current_close is None or previous_close is None:
+                return None
+            current_close = float(current_close)
+            previous_close = float(previous_close)
+            current_time = self._market_now()
+            return {
+                'symbol': live_snapshot.get('symbol') or closed_snapshot.get('symbol') or symbol,
+                'option_type': option_type,
+                'strike_price': strike,
+                'previous_candle_close': previous_close,
+                'previous_candle_time': closed_snapshot.get('previous_candle_time'),
+                'current_candle_open': closed_snapshot.get('current_candle_open'),
+                'current_candle_high': closed_snapshot.get('current_candle_high'),
+                'current_candle_low': closed_snapshot.get('current_candle_low'),
+                'current_candle_close': current_close,
+                'volume': live_snapshot.get('volume', 0),
+                'open_interest': live_snapshot.get('open_interest', 0),
+                'rsi': None,
+                'candle_time': closed_snapshot.get('candle_time'),
+                'signal_time': current_time
+            }
+        snapshot = self.angel_api.get_recent_option_candle_pair(
+            underlying=symbol,
+            expiry=expiry,
+            strike=strike,
+            option_type=option_type,
+            timeframe=timeframe,
+            exchange='NFO'
+        )
+        if not snapshot:
+            snapshot = self._get_live_option_snapshot_force_check(symbol, expiry, strike, option_type, timeframe)
+        return snapshot
 
     def _open_backtest_scan_log(self, from_date, to_date, timeframe, stocks):
         if not self._backtest_scan_log_enabled:
@@ -2320,6 +2374,10 @@ class ScannerEngine:
             return self.angel_api.market_now()
         except Exception:
             return datetime.now()
+
+    def _normalize_live_candle_logic(self, value):
+        token = str(value or 'closed').strip().lower()
+        return token if token in ('closed', 'cmp') else 'closed'
 
     def _market_is_open(self, dt=None):
         try:

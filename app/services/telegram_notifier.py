@@ -1,4 +1,4 @@
-"""
+﻿"""
 Telegram notification service for scanner signals.
 """
 from __future__ import annotations
@@ -360,11 +360,14 @@ class TelegramNotifier:
         )
 
     def _build_html_message(self, signal: Dict[str, Any], mode: str, user_id: Optional[int] = None) -> str:
-        title = f'{mode.upper()} SIGNAL'
         env_text = html_escape(self.app_env)
-        symbol = html_escape(str(signal.get('symbol') or '-'))
-        strike = html_escape(self._fmt_num(signal.get('strike_price')))
-        option_type = html_escape(str(signal.get('option_type') or '-').upper())
+        contract_label = html_escape(
+            self._fmt_contract_label(
+                signal.get('symbol'),
+                signal.get('strike_price'),
+                signal.get('option_type')
+            )
+        )
         timeframe = html_escape(str(signal.get('timeframe') or '-'))
         entry = html_escape(self._fmt_num(signal.get('entry_price')))
         current = html_escape(self._fmt_num(signal.get('current_price')))
@@ -372,14 +375,19 @@ class TelegramNotifier:
         change_pct = html_escape(self._fmt_pct(signal.get('price_change_percent')))
         volume = html_escape(self._fmt_num(signal.get('volume')))
         rsi = html_escape(self._fmt_num(signal.get('rsi')))
-        detected_at = html_escape(self._fmt_time(signal.get('detected_at')))
         expiry = html_escape(self._fmt_expiry(signal.get('expiry_date')))
+        time_block = self._build_signal_time_block(signal, mode)
+        signal_title = f'🚨🚨 <b>{mode.upper()} TRADE ALERT</b> 🚨🚨'
+        env_block = ''
+        if self.app_env and self.app_env != 'LIVE':
+            env_block = f'<code>{env_text}</code>\n\n'
+
         if self.message_mode == 'SHORT':
             return (
-                f'🚨🚨 <b>{mode.upper()} TRADE ALERT</b> 🚨🚨\n'
-                f'<code>{env_text}</code>\n\n'
-                f'🎯 <b>{symbol} {strike} {option_type}</b>\n'
-                f'⏱ Timeframe: <b>{timeframe}</b>\n\n'
+                f'{signal_title}\n'
+                f'{env_block}'
+                f'🎯 <b>{contract_label}</b>\n'
+                f'⏱️ Timeframe: <b>{timeframe}</b>\n\n'
                 f'💰 Entry Zone: <b>{entry}</b>\n'
                 f'📈 LTP: <b>{current}</b>\n'
                 f'🎯 CMP: <b>{spot}</b>\n'
@@ -387,14 +395,14 @@ class TelegramNotifier:
                 f'📊 Volume: {volume}\n'
                 f'📉 RSI: {rsi}\n'
                 f'📅 Expiry: {expiry}\n\n'
-                f'⏰ Signal Time: <b>{detected_at}</b>'
+                f'{time_block}'
             )
 
         return (
-            f'🚨🚨 <b>{mode.upper()} TRADE ALERT</b> 🚨🚨\n'
-            f'<code>{env_text}</code>\n\n'
-            f'🎯 <b>{symbol} {strike} {option_type}</b>\n'
-            f'⏱ Timeframe: <b>{timeframe}</b>\n\n'
+            f'{signal_title}\n'
+            f'{env_block}'
+            f'🎯 <b>{contract_label}</b>\n'
+            f'⏱️ Timeframe: <b>{timeframe}</b>\n\n'
             f'💰 Entry Zone: <b>{entry}</b>\n'
             f'📈 LTP: <b>{current}</b>\n'
             f'🎯 CMP: <b>{spot}</b>\n'
@@ -402,13 +410,18 @@ class TelegramNotifier:
             f'📊 Volume: {volume}\n'
             f'📉 RSI: {rsi}\n'
             f'📅 Expiry: {expiry}\n\n'
-            f'⏰ Signal Time: <b>{detected_at}</b>'
+            f'{time_block}'
         )
 
     def _build_plain_text_message(self, signal: Dict[str, Any], mode: str, user_id: Optional[int] = None) -> str:
+        contract_label = self._fmt_contract_label(
+            signal.get('symbol'),
+            signal.get('strike_price'),
+            signal.get('option_type')
+        )
         lines = [
             f'🚨 {mode.upper()} SIGNAL [{self.app_env}]',
-            f'📌 {signal.get("symbol", "-")} {self._fmt_num(signal.get("strike_price"))} {str(signal.get("option_type") or "-").upper()}',
+            f'📌 {contract_label}',
             f'🕒 Timeframe: {signal.get("timeframe", "-")}',
             f'💰 Entry: {self._fmt_num(signal.get("entry_price"))}',
             f'📈 Current: {self._fmt_num(signal.get("current_price"))}',
@@ -416,11 +429,221 @@ class TelegramNotifier:
             f'🔺 Change: {self._fmt_pct(signal.get("price_change_percent"))}',
             f'📊 Volume: {self._fmt_num(signal.get("volume"))}',
             f'📉 RSI: {self._fmt_num(signal.get("rsi"))}',
-            f'⏰ Detected: {self._fmt_time(signal.get("detected_at"))}'
+            self._build_signal_time_block(signal, mode, plain_text=True)
         ]
         if self.message_mode != 'SHORT':
             lines.insert(2, f'📅 Expiry: {self._fmt_expiry(signal.get("expiry_date"))}')
         return '\n'.join(lines)
+
+    def _build_signal_time_block(self, signal: Dict[str, Any], mode: str, plain_text: bool = False) -> str:
+        live_logic = str(signal.get('live_candle_logic') or '').strip().lower()
+        detected_at = self._fmt_time(signal.get('detected_at'))
+
+        if mode == 'live' and live_logic == 'cmp':
+            previous_candle_time = self._fmt_time(signal.get('previous_candle_time'))
+            candle_time = self._fmt_time(signal.get('candle_time'))
+            if previous_candle_time != '-' and candle_time != '-':
+                if plain_text:
+                    return (
+                        f'Candle Time: {previous_candle_time} to {candle_time}\n'
+                        f'⏰ Signal Time: {detected_at}'
+                    )
+                return (
+                    f'⏰ Candle Time: <b>{html_escape(previous_candle_time)} to {html_escape(candle_time)}</b>\n'
+                    f'⏰ Signal Time: <b>{html_escape(detected_at)}</b>'
+                )
+
+        previous_candle_time = self._fmt_time(signal.get('previous_candle_time'))
+        candle_time = self._fmt_time(signal.get('candle_time'))
+        if previous_candle_time != '-' and candle_time != '-':
+            if plain_text:
+                return (
+                    f'Previous Candle Time: {previous_candle_time}\n'
+                    f'Current Candle Time: {candle_time}\n'
+                    f'⏰ Signal Time: {detected_at}'
+                )
+            return (
+                f'Previous Candle Time: <b>{html_escape(previous_candle_time)}</b>\n'
+                f'Current Candle Time: <b>{html_escape(candle_time)}</b>\n'
+                f'⏰ Signal Time: <b>{html_escape(detected_at)}</b>'
+            )
+
+        if plain_text:
+            return f'⏰ Signal Time: {detected_at}'
+        return f'⏰ Signal Time: <b>{html_escape(detected_at)}</b>'
+
+    def _fmt_contract_label(self, symbol: Any, strike_price: Any, option_type: Any) -> str:
+        symbol_text = str(symbol or '').strip().upper()
+        strike_text = self._fmt_num(strike_price)
+        option_text = str(option_type or '').strip().upper() or '-'
+        if not symbol_text:
+            return f'- {strike_text} {option_text}'.strip()
+
+        try:
+            import re
+            match = re.match(r'^(.*?)(\d{2})([A-Z]{3})(\d{2})(\d+(?:\.\d+)?)(CE|PE)$', symbol_text)
+        except Exception:
+            match = None
+        if match:
+            underlying = match.group(1).strip()
+            if underlying:
+                return f'{underlying} {strike_text} {option_text}'.strip()
+        return f'{symbol_text} {strike_text} {option_text}'.strip()
+
+    def _fmt_pct(self, value: Any) -> str:
+        if value in (None, ''):
+            return '-'
+        try:
+            num = float(value)
+            return f'{num:.2f}%'
+        except Exception:
+            return f'{value}%'
+
+    def _fmt_expiry(self, value: Any) -> str:
+        if value in (None, ''):
+            return '-'
+        if isinstance(value, datetime):
+            return value.date().isoformat()
+        return str(value)
+
+    def _fmt_time(self, value: Any) -> str:
+        parsed = self._parse_dt(value)
+        if not parsed:
+            return '-'
+        try:
+            target_tz = ZoneInfo(self.timezone_name) if ZoneInfo else timezone.utc
+            parsed = parsed.astimezone(target_tz)
+            suffix = self.timezone_name
+        except Exception:
+            parsed = parsed.astimezone(timezone.utc)
+            suffix = 'UTC'
+        return parsed.strftime('%Y-%m-%d %I:%M:%S %p') + f' ({suffix})'
+
+    def _parse_dt(self, value: Any) -> Optional[datetime]:
+        if isinstance(value, datetime):
+            dt = value
+        elif value in (None, ''):
+            return None
+        else:
+            text = str(value).strip()
+            if text.endswith('Z'):
+                text = text[:-1] + '+00:00'
+            try:
+                dt = datetime.fromisoformat(text)
+            except Exception:
+                return None
+
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+
+
+_notifier_instance: Optional[TelegramNotifier] = None
+_notifier_lock = Lock()
+
+
+def get_telegram_notifier() -> TelegramNotifier:
+    global _notifier_instance
+    if _notifier_instance is None:
+        with _notifier_lock:
+            if _notifier_instance is None:
+                _notifier_instance = TelegramNotifier()
+    return _notifier_instance
+
+
+def invalidate_notification_pref_cache(user_id: Optional[int] = None) -> None:
+    try:
+        notifier = get_telegram_notifier()
+        notifier.invalidate_user_pref_cache(user_id)
+    except Exception:
+        pass
+
+
+def send_signal_notification(signal: Dict[str, Any], mode: str = 'live', user_id: Optional[int] = None) -> bool:
+    try:
+        notifier = get_telegram_notifier()
+        sent, reason = notifier.notify_signal(signal or {}, mode=mode, user_id=user_id)
+        if not sent and reason not in (
+            'telegram_disabled_or_unconfigured',
+            'telegram_live_only',
+            'cooldown',
+            'notification_services_disabled'
+        ):
+            logger.info('Telegram notification skipped: %s', reason)
+        return bool(sent)
+    except Exception as exc:
+        logger.warning('Telegram notification error: %s', exc)
+        return False
+
+
+def send_cycle_summary_notification(text: str, user_id: Optional[int] = None) -> Tuple[bool, str]:
+    """Send a live cycle summary message to Telegram without applying cooldown."""
+    try:
+        notifier = get_telegram_notifier()
+        signal_mode = 'live'
+        if not notifier.is_active_for_user(user_id):
+            return False, 'telegram_disabled_or_unconfigured'
+        if notifier.live_only and signal_mode != 'live':
+            return False, 'telegram_live_only'
+        if not notifier._user_notifications_enabled(user_id):
+            return False, 'notification_services_disabled'
+        enabled, mode, channel_override = notifier.resolve_cycle_summary_prefs(user_id)
+        if not enabled:
+            return False, 'cycle_summary_disabled'
+
+        bot_token, channel_id = notifier.resolve_credentials(user_id)
+        if channel_override:
+            channel_id = channel_override
+        endpoint = f'https://api.telegram.org/bot{bot_token}/sendMessage'
+        if isinstance(text, dict):
+            message = notifier._build_cycle_summary_message(text, mode=mode)
+        else:
+            message = str(text or '')
+        payload = {
+            'chat_id': channel_id,
+            'text': message,
+            'disable_web_page_preview': True
+        }
+        if notifier.parse_mode in ('HTML', 'MARKDOWN', 'MARKDOWNV2'):
+            payload['parse_mode'] = notifier.parse_mode
+
+        response = notifier._session.post(endpoint, json=payload, timeout=10)
+        body = response.json() if response.content else {}
+        if response.status_code == 200 and bool(body.get('ok', False)):
+            return True, 'sent'
+        return False, f'http_{response.status_code}'
+    except Exception as exc:
+        return False, f'exception:{exc}'
+
+
+def send_test_notification(text: str, user_id: Optional[int] = None) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
+    try:
+        notifier = get_telegram_notifier()
+        signal_mode = 'live'
+        if not notifier.is_active_for_user(user_id):
+            return False, 'telegram_disabled_or_unconfigured', None
+        if notifier.live_only and signal_mode != 'live':
+            return False, 'telegram_live_only', None
+        if not notifier._user_notifications_enabled(user_id):
+            return False, 'notification_services_disabled', None
+
+        bot_token, channel_id = notifier.resolve_credentials(user_id)
+        endpoint = f'https://api.telegram.org/bot{bot_token}/sendMessage'
+        payload = {
+            'chat_id': channel_id,
+            'text': text,
+            'disable_web_page_preview': True
+        }
+        if notifier.parse_mode in ('HTML', 'MARKDOWN', 'MARKDOWNV2'):
+            payload['parse_mode'] = notifier.parse_mode
+
+        response = notifier._session.post(endpoint, json=payload, timeout=10)
+        body = response.json() if response.content else {}
+        if response.status_code == 200 and bool(body.get('ok', False)):
+            return True, 'sent', body
+        return False, f'http_{response.status_code}', body
+    except Exception as exc:
+        return False, f'exception:{exc}', None
 
     def _fmt_num(self, value: Any) -> str:
         if value in (None, ''):
@@ -587,3 +810,4 @@ def send_test_notification(text: str, user_id: Optional[int] = None) -> Tuple[bo
         return False, f'http_{response.status_code}', body
     except Exception as exc:
         return False, f'exception:{exc}', None
+

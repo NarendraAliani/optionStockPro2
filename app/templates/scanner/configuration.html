@@ -45,6 +45,14 @@
                         <small class="form-help">Use 0 to scan all available strikes; 1+ scans nearest strikes only.</small>
                     </div>
                     <div class="form-group">
+                        <label class="form-label" for="liveCandleLogic">Live Candle Comparison Logic</label>
+                        <select class="form-control" id="liveCandleLogic">
+                            <option value="closed">Closed Candle Comparison Logic</option>
+                            <option value="cmp">Live Candle Comparison Logic</option>
+                        </select>
+                        <small class="form-help">Live only. Choose whether the current live price should use the latest closed candle or live CMP.</small>
+                    </div>
+                    <div class="form-group">
                         <label class="form-label" for="liveExcludeAtmStrikes">Live: Exclude ATM Strikes</label>
                         <input type="number" class="form-control" id="liveExcludeAtmStrikes" value="0" min="0" max="10">
                         <small class="form-help">Live mode only. 0 disables. 3 excludes ATM and the next 3 strikes on both sides.</small>
@@ -356,6 +364,7 @@
                 }
                 toggleStockMode();
                 $('#strikeRange').val((cfg.strikeRange ?? 0));
+                $('#liveCandleLogic').val(cfg.liveCandleLogic || 'closed');
                 $('#liveExcludeAtmStrikes').val((cfg.liveExcludeAtmStrikes ?? 0));
                 $('#priceMultiplier').val(cfg.priceMultiplier || 2);
                 $('#minSignalVolume').val(cfg.minSignalVolume ?? 10);
@@ -408,6 +417,7 @@
             stockSelection: stockSelection,
             strikeRange: $('#strikeRange').val(),
             liveExcludeAtmStrikes: $('#liveExcludeAtmStrikes').val(),
+            liveCandleLogic: $('#liveCandleLogic').val(),
             priceMultiplier: $('#priceMultiplier').val(),
             minSignalVolume: $('#minSignalVolume').val(),
             timeframe: $('#timeframe').val(),

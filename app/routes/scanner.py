@@ -29,6 +29,7 @@ LIVE_TRACE_FILE = os.path.join('logs', 'live_trace.log')
 DEFAULT_SCAN_WORKERS = 8
 VALID_SCAN_PROFILES = {'conservative', 'balanced', 'aggressive'}
 VALID_REBALANCE_FREQUENCIES = {'daily', 'weekly', 'monthly'}
+VALID_LIVE_CANDLE_LOGICS = {'closed', 'cmp'}
 
 
 def _trace_live(message):
@@ -48,6 +49,7 @@ def _default_config_payload():
         'stockSelection': 'all',
         'strikeRange': 0,
         'liveExcludeAtmStrikes': 0,
+        'liveCandleLogic': 'closed',
         'minSignalVolume': 10,
         'priceMultiplier': 2.0,
         'timeframe': 15,
@@ -100,6 +102,11 @@ def _normalize_profile(value, default='balanced'):
 def _normalize_rebalance_frequency(value, default='weekly'):
     token = str(value or default).strip().lower()
     return token if token in VALID_REBALANCE_FREQUENCIES else default
+
+
+def _normalize_live_candle_logic(value, default='closed'):
+    token = str(value or default).strip().lower()
+    return token if token in VALID_LIVE_CANDLE_LOGICS else default
 
 
 def _user_runtime_defaults():
@@ -280,6 +287,7 @@ def _get_user_default_config(user_id):
         'stockSelection': stock_selection if stock_selection else 'all',
         'strikeRange': int(cfg.strike_range) if cfg.strike_range is not None else 0,
         'liveExcludeAtmStrikes': int(cfg.live_exclude_atm_strikes or 0),
+        'liveCandleLogic': _normalize_live_candle_logic(getattr(cfg, 'live_candle_logic', 'closed')),
         'minSignalVolume': int(cfg.min_signal_volume or 10),
         'priceMultiplier': float(cfg.price_multiplier or 2.0),
         'timeframe': int(str(cfg.timeframe or '5').replace('min', '')),
@@ -379,6 +387,7 @@ def save_scanner_config():
     cfg.stock_selection = payload['stockSelection']
     cfg.strike_range = payload['strikeRange']
     cfg.live_exclude_atm_strikes = _clamp_int(payload.get('liveExcludeAtmStrikes', 0), 0, 10, 0)
+    cfg.live_candle_logic = _normalize_live_candle_logic(payload.get('liveCandleLogic', 'closed'))
     cfg.min_signal_volume = _clamp_int(payload.get('minSignalVolume', 10), 0, 1_000_000, 10)
     cfg.price_multiplier = payload['priceMultiplier']
     cfg.timeframe = f"{payload['timeframe']}min"
@@ -472,6 +481,7 @@ def import_scanner_config():
     cfg.stock_selection = payload['stockSelection']
     cfg.strike_range = payload['strikeRange']
     cfg.live_exclude_atm_strikes = _clamp_int(payload.get('liveExcludeAtmStrikes', 0), 0, 10, 0)
+    cfg.live_candle_logic = _normalize_live_candle_logic(payload.get('liveCandleLogic', 'closed'))
     cfg.min_signal_volume = _clamp_int(payload.get('minSignalVolume', 10), 0, 1_000_000, 10)
     cfg.price_multiplier = payload['priceMultiplier']
     cfg.timeframe = f"{payload['timeframe']}min"
